@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0a0a0a;
+  --panel: #111111;
+  --line: #1f1f1f;
+  --ink: #fafafa;
+  --ink-2: #a3a3a3;
+  --ink-3: #737373;
+  --above: #34d399;
+  --below: #fb7185;
+  --target: #f59e0b;
+  --prob: #3987e5;
+  color-scheme: dark;
+}
+body { background: var(--bg); color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif; }
+.num { font-variant-numeric: tabular-nums; }

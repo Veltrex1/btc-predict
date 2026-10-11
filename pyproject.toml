@@ -1,0 +1,28 @@
+[project]
+name = "btc-predict"
+version = "0.1.0"
+description = "Kalshi 15-minute BTC ABOVE/BELOW signal: data backfill, model, live server and Mac menu-bar widget"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.1",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "scikit-learn>=1.5",
+    "pyarrow>=16",
+    "requests>=2.32",
+    "httpx>=0.27",
+    "websockets>=13",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "matplotlib>=3.9",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
