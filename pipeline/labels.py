@@ -1,7 +1,7 @@
 """Window targets and outcomes.
 
 A Kalshi 15-minute window opens at :00/:15/:30/:45 UTC. YES ("above") wins if
-the settlement price at close is above the target set at open. Kalshi's own
+the settlement price at close is at least the target set at open (strike_type greater_or_equal). Kalshi's own
 target and result are used whenever we have them; otherwise both are
 approximated from 1-minute bars (see config.DEFAULT_SETTLE_MODE).
 """
@@ -35,7 +35,7 @@ def proxy_windows(bars: pd.DataFrame, mode: str) -> pd.DataFrame:
     w["target_proxy"] = ref.reindex(opens - MIN).to_numpy()
     w["settle_proxy"] = ref.reindex(opens + WIN - MIN).to_numpy()
     w = w.dropna()
-    w["label_proxy"] = (w["settle_proxy"] > w["target_proxy"]).astype(int)
+    w["label_proxy"] = (w["settle_proxy"] >= w["target_proxy"]).astype(int)
     return w
 
 
@@ -66,7 +66,7 @@ def disagreement(windows: pd.DataFrame) -> dict:
     k = windows[windows["label_source"] == "kalshi"]
     if k.empty:
         return {"n": 0}
-    proxy_vs_kalshi_target = (k["settle_proxy"] > k["target"]).astype(int)
+    proxy_vs_kalshi_target = (k["settle_proxy"] >= k["target"]).astype(int)
     return {
         "n": int(len(k)),
         "proxy_label_disagree": float((k["label_proxy"] != k["label"]).mean()),

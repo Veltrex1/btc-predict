@@ -21,6 +21,8 @@ def test_proxy_windows_align_to_quarter_hours(bars):
     W = w.index[10]
     assert w.loc[W, "target_proxy"] == bars.loc[W - pd.Timedelta(minutes=1), "close"]
     assert w.loc[W, "settle_proxy"] == bars.loc[W + pd.Timedelta(minutes=14), "close"]
+    # Kalshi rule is "at least": a tie settles YES
+    assert (w["label_proxy"] == (w["settle_proxy"] >= w["target_proxy"]).astype(int)).all()
 
 
 def test_features_do_not_look_ahead(bars):

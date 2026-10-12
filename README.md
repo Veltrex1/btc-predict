@@ -80,7 +80,7 @@ uv run python -m pipeline.report --live 2026-11   # reports/live-2026-11.html + 
 
 Everything is stored in `data/btc.duckdb`. Live calls go in `data/live.sqlite` (table `windows`, one row per window, holding the locked call and Kalshi's result).
 
-**Settlement proxy:** Kalshi settles on CF Benchmarks BRTI, which isn't free. When Kalshi's own result is missing, labels are approximated from Coinbase bars (`--settle avg60` uses the last minute's typical price, as a 60-second average; `close` uses the instantaneous price). `train.py` prints how often the proxy disagrees with Kalshi so you can pick the better mode. Check the KXBTC15M contract rules on Kalshi for the exact settlement definition.
+**Settlement rule (from Kalshi's contract text):** YES if the simple average of the 60 seconds of CF Benchmarks BRTI before close is *at least* the same 60-second average before open (`strike_type: greater_or_equal`). BRTI isn't free, so when Kalshi's own result is missing, labels are approximated from Coinbase bars: `--settle avg60` (default) uses the typical price of the minute before open and before close, which approximates those 60-second averages; `close` uses the instantaneous price. `train.py` prints how often the proxy disagrees with Kalshi's official results.
 
 **More history isn't always better:** BTC's volatility regime changes. More years help the slow features but can dilute recent behaviour. Compare `--years 2/3/5` in the walk-forward and keep whichever wins out of sample.
 
