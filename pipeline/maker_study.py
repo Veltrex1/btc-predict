@@ -64,7 +64,7 @@ def maker_fills(tr: pd.DataFrame) -> pd.DataFrame:
     t = tr.copy()
     t["yes_price"] = t["yes_price_dollars"].astype(float)
     t["count"] = t["count_fp"].astype(float)
-    t["ts"] = pd.to_datetime(t["created_time"], utc=True).dt.tz_convert(None)
+    t["ts"] = pd.to_datetime(t["created_time"], utc=True, format="ISO8601").dt.tz_convert(None)
     t["mins_left"] = (pd.to_datetime(t["close_time"]) - t["ts"]).dt.total_seconds() / 60
     # the maker holds the side opposite the taker, at that side's price
     t["maker_side"] = np.where(t["taker_outcome_side"] == "yes", "no", "yes")
