@@ -44,17 +44,34 @@ def load_inputs(p_col: str) -> pd.DataFrame:
     return df.rename(columns={p_col: "p"}).reset_index(drop=True)
 
 
-def run_window(g: pd.DataFrame, params: Params, equity: float) -> tuple[float, list[dict]]:
-    """Simulate one window. Returns (pnl, trades)."""
+def prepare(df: pd.DataFrame) -> list[tuple]:
+    """Split once into per-window arrays so the parameter grid doesn't regroup the frame each time."""
+    out = []
+    for w, g in df.groupby("window_open", sort=True):
+        g = g.dropna(subset=["yes_bid", "yes_ask"])
+        if g.empty:
+            continue
+        out.append((w, int(g["label"].iloc[0]), g["minute"].to_numpy(), g["secs_left"].to_numpy(dtype=float),
+                    g["p"].to_numpy(dtype=float), g["yes_bid"].to_numpy(dtype=float),
+                    g["yes_ask"].to_numpy(dtype=float)))
+    return out
+
+
+def run_window(win, params: Params, equity: float) -> tuple[float, list[dict]]:
+    """Simulate one window (a tuple from `prepare`, or a DataFrame). Returns (pnl, trades)."""
+    if isinstance(win, pd.DataFrame):
+        prepared = prepare(win)
+        if not prepared:
+            return 0.0, []
+        win = prepared[0]
+    w, label, minutes, secs, ps, bids, asks = win
     pos: Position | None = None
     cash = 0.0
     entries = 0
     trades = []
-    for r in g.itertuples(index=False):
-        if pd.isna(r.yes_bid) or pd.isna(r.yes_ask):
-            continue
-        q = Quote(float(r.yes_bid), float(r.yes_ask))
-        a = decide(pos, float(r.p), q, float(r.secs_left), equity + cash, entries, params)
+    for i in range(len(minutes)):
+        q = Quote(float(bids[i]), float(asks[i]))
+        a = decide(pos, float(ps[i]), q, float(secs[i]), equity + cash, entries, params)
         if a is None:
             continue
         f = fee(a.count, a.price)
@@ -62,50 +79,52 @@ def run_window(g: pd.DataFrame, params: Params, equity: float) -> tuple[float, l
             cash -= a.count * a.price + f
             pos = Position(a.side, a.count, a.price, f)
             entries += 1
-            trades.append({"window_open": r.window_open, "minute": r.minute, "kind": "buy", "side": a.side,
+            trades.append({"window_open": w, "minute": int(minutes[i]), "kind": "buy", "side": a.side,
                            "count": a.count, "price": a.price, "fee": f})
         else:
             cash += a.count * a.price - f
-            trades.append({"window_open": r.window_open, "minute": r.minute, "kind": "sell", "side": a.side,
+            trades.append({"window_open": w, "minute": int(minutes[i]), "kind": "sell", "side": a.side,
                            "count": a.count, "price": a.price, "fee": f, "reason": a.reason})
             pos = None
     if pos is not None:
-        label = int(g["label"].iloc[0])
         won = (pos.side == "yes") == (label == 1)
         cash += pos.count * (1.0 if won else 0.0)
-        trades.append({"window_open": g["window_open"].iloc[0], "minute": 15, "kind": "settle", "side": pos.side,
+        trades.append({"window_open": w, "minute": 15, "kind": "settle", "side": pos.side,
                        "count": pos.count, "price": 1.0 if won else 0.0, "fee": 0.0})
     return cash, trades
 
 
-def simulate(df: pd.DataFrame, params: Params, equity: float = 10.0) -> pd.DataFrame:
+def simulate(windows: list[tuple], params: Params, equity: float = 10.0) -> pd.DataFrame:
     """Every window independently with a fixed $10 equity: per-window P&L."""
     out = []
-    for w, g in df.groupby("window_open", sort=True):
-        pnl, trades = run_window(g, params, equity)
+    for win in windows:
+        pnl, trades = run_window(win, params, equity)
         if trades:
-            out.append({"window_open": w, "pnl": pnl, "fills": sum(t["kind"] != "settle" for t in trades),
+            out.append({"window_open": win[0], "pnl": pnl, "fills": sum(t["kind"] != "settle" for t in trades),
                         "fees": sum(t["fee"] for t in trades),
                         "entries": sum(t["kind"] == "buy" for t in trades),
                         "settled": any(t["kind"] == "settle" for t in trades)})
     return pd.DataFrame(out)
 
 
-def daily_runs(df: pd.DataFrame, params: Params, start: float = 10.0, stop_loss: float = 5.0) -> pd.DataFrame:
+def daily_runs(windows: list[tuple], params: Params, start: float = 10.0, stop_loss: float = 5.0) -> pd.DataFrame:
     """What the user will actually do: start each UTC day with $10, 10% sizing, halt at -$5."""
     rows = []
-    for day, d in df.groupby(df["window_open"].dt.floor("D")):
+    by_day: dict = {}
+    for win in windows:
+        by_day.setdefault(pd.Timestamp(win[0]).floor("D"), []).append(win)
+    for day, ws in sorted(by_day.items()):
         equity, trades, halted, low = start, 0, False, start
-        for _, g in d.groupby("window_open", sort=True):
-            pnl, t = run_window(g, params, equity)
+        for win in ws:
+            pnl, t = run_window(win, params, equity)
             equity += pnl
             trades += sum(x["kind"] == "buy" for x in t)
             low = min(low, equity)
             if equity <= start - stop_loss:
                 halted = True
                 break
-        rows.append({"day": day.date(), "end_equity": equity, "pnl": equity - start, "trades": trades,
-                     "halted": halted, "low": low})
+        rows.append({"day": day.date(), "windows": len(ws), "end_equity": equity, "pnl": equity - start,
+                     "trades": trades, "halted": halted, "low": low})
     return pd.DataFrame(rows)
 
 
@@ -146,16 +165,15 @@ def main() -> None:
     month = df["window_open"].dt.to_period("M")
     months = sorted(month.unique())
     test_m = months[-args.test_months:]
-    tune = df[~month.isin(test_m)]
-    test = df[month.isin(test_m)]
+    tune, test = prepare(df[~month.isin(test_m)]), prepare(df[month.isin(test_m)])
     print(f"p={p_col}; quotes on {df['yes_ask'].notna().mean():.1%} of minutes; "
-          f"tune {tune['window_open'].nunique():,} windows ({months[0]}–{months[-args.test_months - 1]}), "
-          f"test {test['window_open'].nunique():,} windows ({test_m[0]}–{test_m[-1]})")
+          f"tune {len(tune):,} windows with quotes ({months[0]}–{months[-args.test_months - 1]}), "
+          f"test {len(test):,} windows ({test_m[0]}–{test_m[-1]})")
 
     results = []
     for ee, tp, em in itertools.product(*GRID.values()):
         params = replace(Params(), entry_edge=ee, take_profit=tp, exit_margin=em)
-        s = summarize(simulate(tune, params), tune["window_open"].nunique())
+        s = summarize(simulate(tune, params), len(tune))
         results.append({"entry_edge": ee, "take_profit": tp, "exit_margin": em, **s})
         print(f"  ee={ee:.2f} tp={tp:.2f} em={em:.2f}  pnl/day ${s['pnl_per_day']:+.3f}  "
               f"entries {s.get('entries', 0)}", flush=True)
@@ -165,10 +183,10 @@ def main() -> None:
                      exit_margin=float(best["exit_margin"]))
 
     test_sim = simulate(test, params)
-    test_sum = summarize(test_sim, test["window_open"].nunique())
+    test_sum = summarize(test_sim, len(test))
     days = daily_runs(test, params)
     hold_only = summarize(simulate(test, replace(params, take_profit=9.0, exit_margin=9.0)),
-                          test["window_open"].nunique())
+                          len(test))
 
     pd.set_option("display.width", 200, "display.max_columns", 30)
     print("\nTop 10 parameter sets on the TUNING months:")
