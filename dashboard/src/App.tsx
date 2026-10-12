@@ -198,12 +198,13 @@ function ResearchPanel({ r }: { r: Research }) {
   const c = (v?: number | null) => (v == null ? '–' : `${v >= 0 ? '+' : ''}${(v * 100).toFixed(2)}¢`);
   return (
     <Panel title={`Research loop${r.loop ? ` · last run ${et(r.loop.ts.slice(0, 19))} ET` : ' · not run yet'}`}>
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-6">
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-7">
         <Stat label="Windows recorded" value={n('windows_settled')} sub={rec.since ? `since ${String(rec.since).slice(0, 10)}` : undefined} />
         <Stat label="Kalshi trades" value={n('kalshi_trades')} />
         <Stat label="Kalshi book snapshots" value={n('kalshi_book')} />
         <Stat label="Spot updates" value={n('spot')} />
         <Stat label="BRTI index ticks" value={n('brti')} sub={rec.brti ? 'settlement stream on' : 'needs Kalshi API key'} />
+        <Stat label="Polymarket US books" value={n('pmus_book')} sub={rec.pmus_book ? 'arbitrage data on' : 'waiting for listed windows'} />
         <Stat label="Bot" value={r.bot ? `${r.bot.mode} ${r.bot.pnl >= 0 ? '+' : ''}${usd(r.bot.pnl)}` : 'off'} sub={r.bot ? `${r.bot.trade_count} trades` : undefined} />
       </div>
       <div className="mt-4 overflow-x-auto">
