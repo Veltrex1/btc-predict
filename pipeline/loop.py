@@ -107,7 +107,21 @@ def cand_micro() -> list[dict]:
     return [score(pd.Series(win - cost), pd.to_datetime(first.close_ts, unit="ms"), "micro: spot fair value > ask+fee+2c")]
 
 
-CANDIDATES = [cand_taker_model, cand_maker_fills, cand_micro]
+def cand_final_minute() -> list[dict]:
+    """Taker in the last 60 s when the settlement-average-aware fair value beats ask + fee by 2c (needs BRTI stream)."""
+    from . import micro
+    if not micro.DB.exists():
+        return []
+    d, br = micro.load(), micro.load_brti()
+    out = []
+    for lo, hi in ((20, 60), (3, 20)):
+        t = micro.final_minute_trades(d, br, max_secs=hi, min_secs=lo)
+        if len(t):
+            out.append(score(t.pnl, pd.to_datetime(t.close_ts, unit="ms"), f"final minute: taker {lo}-{hi}s left, edge > 2c"))
+    return out
+
+
+CANDIDATES = [cand_taker_model, cand_maker_fills, cand_micro, cand_final_minute]
 
 
 # ── data top-up ───────────────────────────────────────────────────────
@@ -149,6 +163,7 @@ def cycle(refresh: bool, maker_windows: int) -> list[dict]:
         lines.append(f"| {r['candidate']} | {r['windows']} | {f(r.get('pnl_recent'))} | {f(r.get('pnl_prior'))} | "
                      f"{r.get('t_stat', 0):.2f} | {'YES' if r.get('promote') else 'no'} |")
     LATEST.write_text("\n".join(lines) + "\n")
+    (DATA_DIR / "loop_latest.json").write_text(json.dumps({"ts": stamp, "results": results}, default=str))
     print("\n".join(lines))
     return results
 

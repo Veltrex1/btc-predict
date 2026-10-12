@@ -113,6 +113,104 @@ def by_phase(p: pd.DataFrame) -> pd.DataFrame:
         "mean_abs_gap": (g.fair - g.mid).abs().mean()}), include_groups=False)
 
 
+# ── final minute: the settlement average is partly locked in ─────────────────────────
+def settle_fair(value: np.ndarray, partial_avg: np.ndarray, n_done: np.ndarray, target: np.ndarray,
+                secs_left: np.ndarray, sigma_usd_1s: float) -> np.ndarray:
+    """P(final 60-tick BRTI average >= target).
+
+    Inside the final minute, n_done ticks are already averaged into partial_avg and the
+    remaining m = 60 - n_done ticks follow a random walk from the current value, so
+    final = (n_done*partial + m*value + sum of m random-walk steps) / 60 with
+    sd = sigma * sqrt(m(m+1)(2m+1)/6) / 60. Before the final minute, partial is unused and
+    the variance is (secs_left - 60) + 61*121/(6*60) ticks of sigma^2."""
+    n = np.clip(np.nan_to_num(n_done, nan=0.0), 0, 60)
+    inside = (secs_left <= 60) & (n > 0)
+    m = np.where(inside, 60 - n, 60.0)
+    mean = np.where(inside, (n * np.nan_to_num(partial_avg) + m * value) / 60.0, value)
+    var_inside = m * (m + 1) * (2 * m + 1) / 6.0 / 3600.0
+    var_before = np.maximum(secs_left - 60, 0) + 61 * 121 / 360.0
+    sd = sigma_usd_1s * np.sqrt(np.where(inside, var_inside, var_before))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = (mean - target) / np.where(sd > 0, sd, np.nan)
+    return np.where(sd > 0, ndtr(z), (mean >= target).astype(float))
+
+
+def load_brti(db=DB) -> pd.DataFrame:
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        b = pd.read_sql("SELECT source_ts, value, settle_avg, settle_n FROM brti WHERE feed = '1hz' AND value IS NOT NULL", c)
+    except Exception:  # noqa: BLE001 - table absent until the API key is configured
+        b = pd.DataFrame(columns=["source_ts", "value", "settle_avg", "settle_n"])
+    c.close()
+    return b
+
+
+def final_minute_trades(d: dict, brti: pd.DataFrame, max_secs: float = 60, min_secs: float = 3,
+                        thr: float = 0.02) -> pd.DataFrame:
+    """First taker trade per settled market when settlement-aware fair value beats ask + fee by `thr`
+    with between min_secs and max_secs left. Returns ticker, close_ts, side, cost, pnl."""
+    if brti.empty:
+        return pd.DataFrame(columns=["ticker", "close_ts", "side", "cost", "pnl"])
+    br = brti.assign(sec=brti.source_ts // 1000).groupby("sec").last()
+    sigma = float(br["value"].diff().tail(3600).std())
+    b = d["book"].assign(sec=d["book"].ts // 1000).groupby(["ticker", "sec"]).last().reset_index()
+    m = d["markets"].dropna(subset=["target", "result"])
+    b = b.merge(m[["ticker", "close_ts", "target", "result"]], on="ticker")
+    b["secs_left"] = b.close_ts / 1000 - b.sec
+    b = b[(b.secs_left >= min_secs) & (b.secs_left <= max_secs)].join(br, on="sec", how="inner")
+    if b.empty:
+        return pd.DataFrame(columns=["ticker", "close_ts", "side", "cost", "pnl"])
+    b["fair"] = settle_fair(b.value.to_numpy(), b.settle_avg.to_numpy(), b.settle_n.to_numpy(),
+                            b.target.to_numpy(), b.secs_left.to_numpy(), sigma)
+    b["cy"] = b.yes_ask + b.yes_ask.map(lambda a: fee(1, a))
+    b["cn"] = (1 - b.yes_bid) + b.yes_bid.map(lambda x: fee(1, 1 - x))
+    yes = b[b.fair - b.cy > thr].assign(side="yes", cost=lambda x: x.cy)
+    no = b[(1 - b.fair) - b.cn > thr].assign(side="no", cost=lambda x: x.cn)
+    first = pd.concat([yes, no]).sort_values("sec").drop_duplicates("ticker")
+    first["pnl"] = np.where(first.side == first.result, 1.0, 0.0) - first.cost
+    return first[["ticker", "close_ts", "side", "cost", "pnl"]]
+
+
+def final_minute(d: dict, brti: pd.DataFrame) -> dict:
+    """Kalshi quotes in the last 90 s vs settlement-aware fair value; realized P&L of taking the edge."""
+    if brti.empty:
+        return {"status": "no BRTI data yet (needs the Kalshi API key on the recorder)"}
+    br = brti.assign(sec=brti.source_ts // 1000).groupby("sec").last()
+    sigma = float(br["value"].diff().tail(3600).std())
+    b = d["book"].assign(sec=d["book"].ts // 1000).groupby(["ticker", "sec"]).last().reset_index()
+    m = d["markets"].dropna(subset=["target", "result"])
+    b = b.merge(m[["ticker", "close_ts", "target", "result", "expiration_value"]], on="ticker")
+    b["secs_left"] = b.close_ts / 1000 - b.sec
+    b = b[(b.secs_left > 0) & (b.secs_left <= 90)].join(br, on="sec", how="inner")
+    if b.empty:
+        return {"status": "no overlapping final-minute data yet"}
+    b["fair"] = settle_fair(b.value.to_numpy(), b.settle_avg.to_numpy(), b.settle_n.to_numpy(),
+                            b.target.to_numpy(), b.secs_left.to_numpy(), sigma)
+    b["y"] = (b.result == "yes").astype(float)
+    b["ey"] = b.fair - b.yes_ask - b.yes_ask.map(lambda a: fee(1, a))
+    b["en"] = (1 - b.fair) - (1 - b.yes_bid) - b.yes_bid.map(lambda x: fee(1, 1 - x))
+    # settlement check: our last full average vs Kalshi's official expiration value
+    last = br[br.settle_n == 60].settle_avg
+    chk = m.assign(sec=(m.close_ts // 1000)).join(last.rename("our_avg"), on="sec").dropna(subset=["our_avg", "expiration_value"])
+    rows = []
+    for lo, hi in ((60, 90), (40, 60), (20, 40), (5, 20)):
+        g = b[(b.secs_left > lo) & (b.secs_left <= hi)] if lo else b[b.secs_left <= hi]
+        for thr in (0.0, 0.02):
+            yes, no = g[g.ey > thr], g[g.en > thr]
+            first = pd.concat([yes.assign(side="yes"), no.assign(side="no")]).sort_values("sec").drop_duplicates("ticker")
+            cost = np.where(first.side == "yes", first.yes_ask + first.yes_ask.map(lambda a: fee(1, a)),
+                            (1 - first.yes_bid) + first.yes_bid.map(lambda x: fee(1, 1 - x)))
+            win = np.where(first.side == "yes", first.y, 1 - first.y)
+            rows.append({"secs_left": f"{lo}-{hi}", "edge_over": thr, "markets_traded": len(first),
+                         "markets_seen": g.ticker.nunique(), "avg_pnl": float(np.mean(win - cost)) if len(first) else None})
+    return {"status": "ok", "sigma_usd_1s": sigma, "markets": int(b.ticker.nunique()),
+            "brier_market": float((((b.yes_bid + b.yes_ask) / 2 - b.y) ** 2).mean()),
+            "brier_fair": float(((b.fair - b.y) ** 2).mean()),
+            "settle_check_n": int(len(chk)),
+            "settle_check_max_abs_diff": float((chk.our_avg - chk.expiration_value).abs().max()) if len(chk) else None,
+            "table": pd.DataFrame(rows)}
+
+
 def main() -> None:
     d = load()
     p = build_panel(d)
@@ -127,6 +225,10 @@ def main() -> None:
         print(by_phase(p).round(4).to_string())
         print("\nTaker trades when fair value beats ask + fee by a margin (realized, settled markets only):")
         print(stale_gaps(p).round(4).to_string(index=False))
+    fm = final_minute(d, load_brti())
+    print("\nFinal minute (settlement-average-aware fair value):")
+    for k, v in fm.items():
+        print(v.round(4).to_string(index=False) if isinstance(v, pd.DataFrame) else f"  {k}: {v}")
 
 
 if __name__ == "__main__":

@@ -30,6 +30,13 @@ interface Portfolio {
   trades?: Trade[]; trade_count?: number;
 }
 
+interface LoopRow { candidate: string; windows?: number; pnl_recent?: number | null; pnl_prior?: number | null; t_stat?: number; promote?: boolean; error?: string }
+interface Research {
+  loop: { ts: string; results: LoopRow[] } | null;
+  recorder: Record<string, number | string | null>;
+  bot: { mode: string; equity: number; pnl: number; trade_count: number; halted: string | null; allocation: number } | null;
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────
 const usd = (n?: number | null) => n == null ? '–' : n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 const pct = (n?: number | null, d = 1) => n == null ? '–' : `${(n * 100).toFixed(d)}%`;
@@ -185,12 +192,51 @@ function PortfolioPanel({ pf }: { pf: Portfolio }) {
   );
 }
 
+function ResearchPanel({ r }: { r: Research }) {
+  const rec = r.recorder ?? {};
+  const n = (k: string) => (typeof rec[k] === 'number' ? (rec[k] as number).toLocaleString('en-US') : '–');
+  const c = (v?: number | null) => (v == null ? '–' : `${v >= 0 ? '+' : ''}${(v * 100).toFixed(2)}¢`);
+  return (
+    <Panel title={`Research loop${r.loop ? ` · last run ${et(r.loop.ts.slice(0, 19))} ET` : ' · not run yet'}`}>
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-6">
+        <Stat label="Windows recorded" value={n('windows_settled')} sub={rec.since ? `since ${String(rec.since).slice(0, 10)}` : undefined} />
+        <Stat label="Kalshi trades" value={n('kalshi_trades')} />
+        <Stat label="Kalshi book snapshots" value={n('kalshi_book')} />
+        <Stat label="Spot updates" value={n('spot')} />
+        <Stat label="BRTI index ticks" value={n('brti')} sub={rec.brti ? 'settlement stream on' : 'needs Kalshi API key'} />
+        <Stat label="Bot" value={r.bot ? `${r.bot.mode} ${r.bot.pnl >= 0 ? '+' : ''}${usd(r.bot.pnl)}` : 'off'} sub={r.bot ? `${r.bot.trade_count} trades` : undefined} />
+      </div>
+      <div className="mt-4 overflow-x-auto">
+        <table className="num w-full text-left font-mono text-sm">
+          <thead className="text-xs text-[var(--ink-3)]">
+            <tr><th className="py-1 pr-4">candidate strategy</th><th className="pr-4">windows</th><th className="pr-4">P&amp;L/contract last 14d</th><th className="pr-4">prior 14d</th><th className="pr-4">t-stat</th><th>verdict</th></tr>
+          </thead>
+          <tbody>
+            {(r.loop?.results ?? []).map((x, i) => (
+              <tr key={i} className="border-t border-[var(--line)]">
+                <td className="py-1 pr-4 font-sans">{x.candidate}</td>
+                <td className="pr-4">{x.error ? 'error' : x.windows}</td>
+                <td className="pr-4" style={{ color: (x.pnl_recent ?? 0) > 0 ? 'var(--above)' : 'var(--below)' }}>{c(x.pnl_recent)}</td>
+                <td className="pr-4" style={{ color: (x.pnl_prior ?? 0) > 0 ? 'var(--above)' : 'var(--below)' }}>{c(x.pnl_prior)}</td>
+                <td className="pr-4">{x.t_stat?.toFixed(2) ?? '–'}</td>
+                <td style={{ color: x.promote ? 'var(--above)' : 'var(--ink-3)' }}>{x.promote ? 'PROMOTE' : (x.windows ?? 0) < 300 ? 'collecting' : 'rejected'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <p className="mt-2 text-xs text-[var(--ink-3)]">A strategy is promoted only with ≥300 windows, t-stat ≥ 2, and positive P&amp;L after fees in both of the last two 14-day periods. Re-scored every 6 hours.</p>
+      </div>
+    </Panel>
+  );
+}
+
 // ─── page ────────────────────────────────────────────────────────────
 export default function App() {
   const sig = usePoll<Signal>('/signal', 1000);
   const series = usePoll<{ snapshots: Snapshot[]; bars: Bar[] }>('/series', 5000);
   const history = usePoll<WindowRow[]>('/history?limit=32', 15000);
   const pf = usePoll<Portfolio>('/portfolio', 3000);
+  const research = usePoll<Research>('/research', 30000);
   const ok = sig?.status === 'ok';
   const month = sig?.month;
   const side = sig?.side;
@@ -237,6 +283,7 @@ export default function App() {
       </div>
 
       {pf && pf.mode !== 'off' && <PortfolioPanel pf={pf} />}
+      {research && <ResearchPanel r={research} />}
 
       <div className="grid gap-4 md:grid-cols-2">
         <Panel title="Last hour (1-minute candles)"><Candles bars={series?.bars ?? []} target={sig?.target} price={sig?.price} /></Panel>

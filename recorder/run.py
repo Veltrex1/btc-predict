@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -41,6 +42,12 @@ CREATE TABLE IF NOT EXISTS kalshi_trades (trade_id TEXT PRIMARY KEY, ts INTEGER,
     count REAL, taker_side TEXT, recv_ts INTEGER);
 CREATE TABLE IF NOT EXISTS kalshi_markets (ticker TEXT PRIMARY KEY, open_ts INTEGER, close_ts INTEGER, target REAL,
     result TEXT, expiration_value REAL);
+CREATE TABLE IF NOT EXISTS brti (ts INTEGER, feed TEXT, source_ts INTEGER, value REAL, avg60 REAL,
+    settle_avg REAL, settle_n INTEGER);
+CREATE INDEX IF NOT EXISTS brti_ts ON brti(source_ts);
+CREATE TABLE IF NOT EXISTS kalshi_ob (ts INTEGER, ticker TEXT, kind TEXT, side TEXT, price REAL, size REAL,
+    levels TEXT, seq INTEGER, exch_ts INTEGER);
+CREATE INDEX IF NOT EXISTS kob_ts ON kalshi_ob(ts);
 CREATE TABLE IF NOT EXISTS deribit (ts INTEGER, instrument TEXT, mark REAL, index_price REAL, bid REAL, ask REAL,
     funding REAL, open_interest REAL);
 """
@@ -206,6 +213,79 @@ async def kalshi() -> None:
             await asyncio.sleep(max(0.0, 1.0 - (time.time() - t0)))
 
 
+# ── Kalshi authenticated websocket (needs KALSHI_KEY_ID + KALSHI_PRIVATE_KEY_PATH) ──────
+KALSHI_WS = os.environ.get("KALSHI_WS", "wss://api.elections.kalshi.com/trade-api/ws/v2")
+
+
+def parse_cf(msg: dict, feed: str) -> tuple:
+    """One row for the brti table from a cfbenchmarks_value(_5hz) message body."""
+    if feed == "5hz":
+        return (now_ms(), feed, msg.get("source_ts_ms"), float(msg["value_usd"]), None, None, None)
+    raw = json.loads(msg.get("data") or "{}")
+    a60 = msg.get("avg_60s_data") or {}
+    s15 = msg.get("last_60s_windowed_average_15min") or {}
+    return (now_ms(), feed, raw.get("time"), float(raw["value"]) if raw.get("value") else None,
+            float(a60["value"]) if a60.get("value") else None,
+            float(s15["value"]) if s15.get("value") else None, s15.get("window_size"))
+
+
+async def kalshi_ws() -> None:
+    from server.kalshi_client import load_private_key, sign
+    key = load_private_key(os.environ["KALSHI_PRIVATE_KEY_PATH"])
+    ts = str(now_ms())
+    headers = {"KALSHI-ACCESS-KEY": os.environ["KALSHI_KEY_ID"], "KALSHI-ACCESS-TIMESTAMP": ts,
+               "KALSHI-ACCESS-SIGNATURE": sign(key, ts + "GET" + "/trade-api/ws/v2")}
+    async with websockets.connect(KALSHI_WS, additional_headers=headers, ping_interval=20, max_size=2**23) as ws:
+        cmd_id = 1
+
+        async def send(params: dict) -> None:
+            nonlocal cmd_id
+            await ws.send(json.dumps({"id": cmd_id, "cmd": "subscribe", "params": params}))
+            cmd_id += 1
+
+        await send({"channels": ["cfbenchmarks_value"], "index_ids": ["BRTI"]})
+        await send({"channels": ["cfbenchmarks_value_5hz"], "index_ids": ["BRTI"]})
+        watched: set[str] = set()
+
+        async def watch_markets() -> None:
+            async with httpx.AsyncClient(timeout=10) as c:
+                while True:
+                    r = await c.get(f"{KALSHI_BASE}/markets", params={"series_ticker": SERIES, "status": "open"})
+                    for m in r.json().get("markets", []):
+                        if m["ticker"] not in watched and _ms(m["close_time"]) - now_ms() < 20 * 60_000:
+                            watched.add(m["ticker"])
+                            await send({"channels": ["orderbook_delta", "trade"], "market_tickers": [m["ticker"]],
+                                        "use_yes_price": True})
+                    await asyncio.sleep(20)
+
+        watcher = asyncio.create_task(watch_markets())
+        try:
+            async for raw in ws:
+                m = json.loads(raw)
+                typ, body = m.get("type"), m.get("msg") or {}
+                if typ == "cfbenchmarks_value" and body.get("index_id") == "BRTI":
+                    SINK.add("brti", parse_cf(body, "1hz"))
+                elif typ == "cfbenchmarks_value_5hz" and body.get("index_id") == "BRTI":
+                    SINK.add("brti", parse_cf(body, "5hz"))
+                elif typ == "orderbook_snapshot":
+                    SINK.add("kalshi_ob", (now_ms(), body.get("market_ticker"), "snapshot", None, None, None,
+                                           json.dumps({"yes": body.get("yes_dollars_fp"), "no": body.get("no_dollars_fp")}),
+                                           m.get("seq"), None))
+                elif typ == "orderbook_delta":
+                    SINK.add("kalshi_ob", (now_ms(), body.get("market_ticker"), "delta", body.get("side"),
+                                           float(body["price_dollars"]), float(body["delta_fp"]), None, m.get("seq"),
+                                           body.get("ts_ms")))
+                elif typ == "trade":
+                    t_ms = int(body.get("ts_ms") or int(body.get("ts", 0)) * 1000)
+                    SINK.add("kalshi_trades", (body["trade_id"], t_ms, body.get("market_ticker"),
+                                               float(body["yes_price_dollars"]), float(body["count_fp"]),
+                                               body.get("taker_outcome_side") or body.get("taker_side"), now_ms()))
+                elif typ == "error":
+                    log.warning("kalshi ws error: %s", body)
+        finally:
+            watcher.cancel()
+
+
 async def kalshi_results() -> None:
     """Fill in official results for recorded markets once they settle."""
     async with httpx.AsyncClient(timeout=10) as c:
@@ -242,6 +322,10 @@ async def main() -> None:
     SINK = Sink(DB)
     feeds = {"coinbase": coinbase, "kraken": kraken, "bitstamp": bitstamp, "gemini": gemini,
              "deribit": deribit, "kalshi": kalshi, "kalshi_results": kalshi_results}
+    if os.environ.get("KALSHI_KEY_ID") and os.environ.get("KALSHI_PRIVATE_KEY_PATH"):
+        feeds["kalshi_ws"] = kalshi_ws
+    else:
+        log.info("no Kalshi API key configured: BRTI settlement stream and websocket order book disabled")
     await asyncio.gather(flusher(), *(keep(n, f) for n, f in feeds.items()))
 
 

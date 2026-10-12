@@ -575,6 +575,35 @@ def get_series() -> dict:
     return {"snapshots": snaps, "bars": bars.replace({np.nan: None}).to_dict("records")}
 
 
+@app.get("/research")
+def get_research() -> dict:
+    """Learning-loop scores, how much the recorder has collected, and the bot's shadow/live results."""
+    from pipeline.config import DATA_DIR
+    out: dict = {"loop": None, "recorder": {}, "bot": None}
+    lj = DATA_DIR / "loop_latest.json"
+    if lj.exists():
+        out["loop"] = json.loads(lj.read_text())
+    ticks = DATA_DIR / "ticks.sqlite"
+    if ticks.exists():
+        c = sqlite3.connect(f"file:{ticks}?mode=ro", uri=True, timeout=2)
+        try:
+            for t in ("spot", "kalshi_book", "kalshi_trades", "deribit", "brti", "kalshi_ob"):
+                try:  # max(rowid) is instant even on huge tables
+                    out["recorder"][t] = c.execute(f"SELECT max(rowid) FROM {t}").fetchone()[0] or 0
+                except sqlite3.Error:
+                    out["recorder"][t] = None
+            out["recorder"]["windows_settled"] = c.execute(
+                "SELECT count(*) FROM kalshi_markets WHERE result IS NOT NULL").fetchone()[0]
+            row = c.execute("SELECT min(ts) FROM kalshi_book").fetchone()
+            out["recorder"]["since"] = pd.Timestamp(row[0], unit="ms").isoformat() if row and row[0] else None
+        finally:
+            c.close()
+    if TRADER is not None:
+        st = TRADER.status()
+        out["bot"] = {k: st[k] for k in ("mode", "equity", "pnl", "trade_count", "halted", "allocation")}
+    return out
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "bars": len(S.bars), "price_age_s": time.time() - S.price_ts if S.price_ts else None,
