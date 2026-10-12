@@ -13,33 +13,33 @@
     "max_price": 0.97
   },
   "test": {
-    "windows": 3890,
-    "windows_traded": 1665,
-    "entries": 1693,
-    "win_rate_windows": 0.5219219219219219,
-    "total_pnl": -92.20255,
-    "pnl_per_day": -2.1952988095238095,
-    "pnl_per_window_traded": -0.05537690690690691,
-    "fees": 58.968900000000005,
-    "share_held_to_settlement": 0.9375375375375375,
+    "windows": 5959,
+    "windows_traded": 2968,
+    "entries": 3028,
+    "win_rate_windows": 0.5384097035040432,
+    "total_pnl": -37.86309,
+    "pnl_per_day": -0.5186724657534246,
+    "pnl_per_window_traded": -0.012757105795148247,
+    "fees": 104.1067,
+    "share_held_to_settlement": 0.9386792452830188,
     "worst_window": -0.9999999999999999
   },
   "hold_only": {
-    "windows": 3890,
-    "windows_traded": 1665,
-    "entries": 1665,
-    "win_rate_windows": 0.5171171171171172,
-    "total_pnl": -68.59900000000002,
-    "pnl_per_day": -1.6333095238095243,
-    "pnl_per_window_traded": -0.041200600600600615,
-    "fees": 54.60510000000001,
+    "windows": 5959,
+    "windows_traded": 2968,
+    "entries": 2968,
+    "win_rate_windows": 0.5313342318059299,
+    "total_pnl": -44.83582999999999,
+    "pnl_per_day": -0.6141894520547944,
+    "pnl_per_window_traded": -0.015106411725067381,
+    "fees": 95.89750000000001,
     "share_held_to_settlement": 1.0,
     "worst_window": -0.9999999999999999
   },
   "daily": {
-    "profitable_share": 0.23809523809523808,
-    "halted_share": 0.42857142857142855,
-    "median_pnl": -3.723100000000005,
-    "mean_pnl": -2.168709999999999
+    "profitable_share": 0.3013698630136986,
+    "halted_share": 0.3698630136986301,
+    "median_pnl": -2.1564999999999976,
+    "mean_pnl": -0.8281161643835616
   }
 }
