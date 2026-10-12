@@ -20,8 +20,30 @@ API = os.environ.get("POLYMARKET_US_API", "https://api.polymarket.us")
 GATEWAY = "https://gateway.polymarket.us"
 
 
-def private_key_from_secret(secret_b64: str) -> ed25519.Ed25519PrivateKey:
-    return ed25519.Ed25519PrivateKey.from_private_bytes(base64.b64decode(secret_b64.strip())[:32])
+def decode_secret(secret: str) -> tuple[bytes, str]:
+    """The portal's secret may be standard base64, base64url or hex; return (bytes, encoding)."""
+    s = "".join(secret.split()).strip('"').strip("'")
+    if len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s):
+        return bytes.fromhex(s), "hex"
+    for name, fn in (("base64", base64.b64decode), ("base64url", base64.urlsafe_b64decode)):
+        try:
+            padded = s + "=" * (-len(s) % 4)
+            raw = fn(padded) if name == "base64url" else fn(padded, validate=True)
+            return raw, name
+        except Exception:  # noqa: BLE001
+            continue
+    raise ValueError("secret is not base64, base64url or hex")
+
+
+def private_key_from_secret(secret: str) -> ed25519.Ed25519PrivateKey:
+    raw, _ = decode_secret(secret)
+    if len(raw) not in (32, 64):
+        # e.g. a PKCS#8 DER blob: the 32-byte seed is the last 32 bytes of the 48-byte structure
+        if len(raw) == 48:
+            raw = raw[16:]
+        else:
+            raise ValueError(f"secret decodes to {len(raw)} bytes; expected 32 or 64")
+    return ed25519.Ed25519PrivateKey.from_private_bytes(raw[:32])
 
 
 class PolymarketUSClient:
@@ -74,11 +96,15 @@ def main() -> None:
     quoted = kid != kid.strip() or '"' in kid or "'" in kid
     is_uuid = bool(re.fullmatch(r"[0-9a-fA-F-]{36}", kid.strip()))
     print(f"key id: {len(kid)} chars, looks like a UUID: {is_uuid}, has spaces/quotes: {quoted}")
+    kinds = {"letters/digits": sum(c.isalnum() for c in sec), "+": sec.count("+"), "/": sec.count("/"),
+             "-": sec.count("-"), "_": sec.count("_"), "=": sec.count("="),
+             "whitespace": sum(c.isspace() for c in sec), "other": sum(not (c.isalnum() or c in "+/-_=" or c.isspace()) for c in sec)}
+    print(f"secret: {len(sec)} chars; character types: {kinds}")
     try:
-        raw = base64.b64decode(sec.strip().strip('"').strip("'"), validate=True)
-        print(f"secret: {len(sec)} chars, decodes to {len(raw)} bytes (expected 32 or 64)")
+        raw, enc = decode_secret(sec)
+        print(f"secret decodes as {enc} to {len(raw)} bytes (expected 32 or 64)")
     except Exception as e:  # noqa: BLE001
-        print(f"secret: {len(sec)} chars, NOT valid base64 ({e}) - likely a copy/paste problem")
+        print(f"secret could not be decoded: {e}")
     c = PolymarketUSClient.from_env()
     pos = c.positions()
     print("authenticated OK; positions response keys:", list(pos.keys()) if isinstance(pos, dict) else type(pos))

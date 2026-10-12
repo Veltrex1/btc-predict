@@ -83,3 +83,19 @@ def test_polymarket_us_signature_verifies():
     msg = h["X-PM-Timestamp"] + "GET" + "/v1/portfolio/positions"
     key.public_key().verify(b64.b64decode(h["X-PM-Signature"]), msg.encode())
     assert h["X-PM-Access-Key"] == "kid"
+
+
+def test_polymarket_us_secret_encodings():
+    import base64 as b64
+
+    from cryptography.hazmat.primitives import serialization
+    from server.polymarket_us_client import private_key_from_secret
+    key = ed25519.Ed25519PrivateKey.generate()
+    seed = key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    der = key.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    for secret in (b64.b64encode(seed + pub).decode(), b64.urlsafe_b64encode(seed + pub).decode().rstrip("="),
+                   (seed + pub).hex(), b64.b64encode(der).decode(), " " + b64.b64encode(seed).decode() + "\n"):
+        got = private_key_from_secret(secret).public_key().public_bytes(serialization.Encoding.Raw,
+                                                                        serialization.PublicFormat.Raw)
+        assert got == pub
