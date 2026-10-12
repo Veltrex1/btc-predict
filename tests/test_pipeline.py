@@ -103,6 +103,9 @@ def test_kalshi_parsing_cents_and_dollars():
     c = parse_candles("T", [{"end_period_ts": 1791750960, "yes_bid": {"close": 61}, "yes_ask": {"close_dollars": "0.6300"},
                              "price": {"close": None}, "volume": 12}])
     assert c.iloc[0]["yes_bid"] == 0.61 and c.iloc[0]["yes_ask"] == 0.63
+    # historical endpoint: `close` is a dollar string, not cents
+    h = parse_candles("T", [{"end_period_ts": 1765427160, "yes_bid": {"close": "0.4500"}, "yes_ask": {"close": "0.8000"}}])
+    assert h.iloc[0]["yes_bid"] == 0.45 and h.iloc[0]["yes_ask"] == 0.80
 
 
 def test_attach_kalshi_prefers_official(bars):

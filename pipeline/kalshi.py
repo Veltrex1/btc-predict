@@ -71,9 +71,16 @@ def parse_market(m: dict) -> dict:
 
 
 def _ohlc_close(d: dict | None) -> float | None:
+    """Candle close in dollars. Live candles use `close_dollars`; the historical endpoint
+    returns `close` as a dollar string ("0.4500"); very old payloads used integer cents."""
     if not d:
         return None
-    return dollars(d, "close")
+    if d.get("close_dollars") not in (None, ""):
+        return float(d["close_dollars"])
+    v = d.get("close")
+    if v in (None, ""):
+        return None
+    return float(v) if isinstance(v, str) else float(v) / 100.0
 
 
 def parse_candles(ticker: str, candles: list[dict]) -> pd.DataFrame:
