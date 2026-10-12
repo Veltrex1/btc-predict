@@ -121,7 +121,18 @@ def cand_final_minute() -> list[dict]:
     return out
 
 
-CANDIDATES = [cand_taker_model, cand_maker_fills, cand_micro, cand_final_minute]
+def cand_arb() -> list[dict]:
+    """Kalshi vs Polymarket US: buy both sides when the pair costs < $1 after both taker fees."""
+    from . import arb
+    if not arb.DB.exists():
+        return []
+    t = arb.first_trades(arb.panel(*arb.load()))
+    if t.empty:
+        return []
+    return [score(t.pnl, pd.to_datetime(t.close_ts, unit="ms"), "arb: Kalshi + Polymarket US pair < $1 after fees")]
+
+
+CANDIDATES = [cand_taker_model, cand_maker_fills, cand_micro, cand_final_minute, cand_arb]
 
 
 # ── data top-up ───────────────────────────────────────────────────────
