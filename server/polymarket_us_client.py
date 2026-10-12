@@ -26,8 +26,8 @@ def private_key_from_secret(secret_b64: str) -> ed25519.Ed25519PrivateKey:
 
 class PolymarketUSClient:
     def __init__(self, key_id: str, secret_b64: str, base: str = API, timeout: float = 10.0):
-        self.key_id = key_id
-        self.key = private_key_from_secret(secret_b64)
+        self.key_id = key_id.strip().strip('"').strip("'")
+        self.key = private_key_from_secret(secret_b64.strip().strip('"').strip("'"))
         self.base = base.rstrip("/")
         self.timeout = timeout
         self.s = requests.Session()
@@ -68,6 +68,17 @@ def main() -> None:
     if not args.check:
         ap.print_help()
         return
+    # shape checks that never print the secrets themselves
+    import re
+    kid, sec = os.environ.get("POLYMARKET_KEY_ID", ""), os.environ.get("POLYMARKET_SECRET_KEY", "")
+    quoted = kid != kid.strip() or '"' in kid or "'" in kid
+    is_uuid = bool(re.fullmatch(r"[0-9a-fA-F-]{36}", kid.strip()))
+    print(f"key id: {len(kid)} chars, looks like a UUID: {is_uuid}, has spaces/quotes: {quoted}")
+    try:
+        raw = base64.b64decode(sec.strip().strip('"').strip("'"), validate=True)
+        print(f"secret: {len(sec)} chars, decodes to {len(raw)} bytes (expected 32 or 64)")
+    except Exception as e:  # noqa: BLE001
+        print(f"secret: {len(sec)} chars, NOT valid base64 ({e}) - likely a copy/paste problem")
     c = PolymarketUSClient.from_env()
     pos = c.positions()
     print("authenticated OK; positions response keys:", list(pos.keys()) if isinstance(pos, dict) else type(pos))
