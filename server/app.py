@@ -387,10 +387,8 @@ def swiftbar_text(sig: dict, st: dict) -> str:
         side = sig["side"]
         e = sig["edge_above"] if side == "ABOVE" else sig["edge_below"]
         if e is not None:
-            col = green if e > 0 else amber
-            lines.append(f"Edge {side} {e * 100:+.1f}¢/contract after fee | color={col} {font}")
-            if e <= 0:
-                lines.append(f"Market already prices this; no value buying | color={amber} {font}")
+            # the model's opinion, not verified edge: out of sample, Kalshi's own price forecasts better
+            lines.append(f"Model vs ask ({side}) {e * 100:+.1f}¢ after fee, unverified | color={gray} {font}")
     else:
         lines.append(f"Kalshi quote unavailable | color={amber} {font}")
     if sig["state"] == "LOCKED":

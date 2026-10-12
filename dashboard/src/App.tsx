@@ -269,8 +269,8 @@ export default function App() {
               : ok ? `Leaning ${sig!.prob_above! >= 0.5 ? 'ABOVE' : 'BELOW'} at ${pct(Math.max(sig!.prob_above!, 1 - sig!.prob_above!))}; locks at ${pct(sig!.tau, 0)}.` : 'Waiting for data.'}
           </div>
           {ok && edge != null && (
-            <div className="mt-2 text-sm" style={{ color: edge > 0 ? 'var(--above)' : 'var(--target)' }}>
-              Edge vs Kalshi ask: {(edge * 100).toFixed(1)}¢ per contract after fee{edge <= 0 ? '. The market already prices this.' : ''}
+            <div className="mt-2 text-sm text-[var(--ink-3)]">
+              Model vs Kalshi ask: {edge >= 0 ? '+' : ''}{(edge * 100).toFixed(1)}¢ after fee (unverified: so far Kalshi's own price is the better forecast)
             </div>
           )}
         </Panel>
