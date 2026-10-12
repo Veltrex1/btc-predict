@@ -29,6 +29,7 @@ sudo -u btc bash -c "cd $APP && $UV sync -q && cd dashboard && npm install --sil
 
 IP=$(curl -fsS https://api.ipify.org)
 HOST="$(echo "$IP" | tr . -).sslip.io"
+sudo -u btc mkdir -p "$APP/data"
 mkdir -p "$ETC" && chmod 700 "$ETC" && chown btc:btc "$ETC"
 if [ ! -f "$ETC/env" ]; then
   TOKEN=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
@@ -64,6 +65,39 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
 
+# recorder (second-level Kalshi book/trades + spot venues) and the learning loop run 24/7
+for svc in recorder loop; do
+  case $svc in
+    recorder) CMD="$UV run python -m recorder.run" ;;
+    loop)     CMD="$UV run python -m pipeline.loop --every 6" ;;
+  esac
+  cat > /etc/systemd/system/btc-$svc.service <<UNIT
+[Unit]
+Description=btc-predict $svc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=btc
+WorkingDirectory=$APP
+EnvironmentFile=$ETC/env
+ExecStart=$CMD
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+done
+
+# one-time history for the model (runs in the background; ~1h): 3 years of Coinbase bars, then train
+if [ ! -f "$APP/models/model.pkl" ]; then
+  sudo -u btc nohup bash -c "cd $APP && $UV run python -m pipeline.backfill_coinbase --days 1095 && \
+    $UV run python -m pipeline.backfill_kalshi --candles --hist-every 6 && \
+    $UV run python -m pipeline.train --years 3 --test-months 11 && systemctl --no-block restart btc-predict || true" \
+    > "$APP/data/bootstrap.log" 2>&1 &
+fi
+
 cat > /etc/caddy/Caddyfile <<CADDY
 $HOST {
     reverse_proxy 127.0.0.1:8765
@@ -71,8 +105,8 @@ $HOST {
 CADDY
 ufw allow OpenSSH >/dev/null && ufw allow 80,443/tcp >/dev/null && ufw --force enable >/dev/null
 systemctl daemon-reload
-systemctl enable --now btc-predict caddy
-systemctl restart caddy btc-predict
+systemctl enable --now btc-predict btc-recorder btc-loop caddy
+systemctl restart caddy btc-predict btc-recorder btc-loop
 
 cat <<DONE
 
