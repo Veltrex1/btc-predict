@@ -22,7 +22,7 @@ from .config import DATA_DIR, DEFAULT_SETTLE_MODE
 from .evaluate import WF_PATH, monthly_table
 from .features import FEATURES, decision_points, minute_frame, rows_from_points
 from .labels import attach_kalshi, disagreement, proxy_windows
-from .model import Policy, Predictor, fit_gbm
+from .model import Policy, Predictor, fit_gbm, used_features
 from .policy import select
 
 
@@ -58,7 +58,7 @@ def walk_forward(rows: pd.DataFrame, test_months: int = 6, train_years: float = 
                      (rows["window_open"] >= m_start - pd.Timedelta(days=int(365 * train_years)))
         test_rows = rows[period == M].copy()
         clf, iso = fit_gbm(rows[train_mask], rows[calib_mask], seed)
-        raw = clf.predict_proba(test_rows[FEATURES].to_numpy(dtype=np.float32))[:, 1]
+        raw = clf.predict_proba(test_rows[used_features(clf)].to_numpy(dtype=np.float32))[:, 1]
         test_rows["p_gbm"] = iso.predict(raw) if iso is not None else raw
         print(f"  {M}: train {train_mask.sum():,} rows, test {len(test_rows):,} rows", flush=True)
         out.append(test_rows)

@@ -76,7 +76,7 @@ def probe() -> None:
     print("open markets:", json.dumps(r.json(), indent=2)[:2000])
 
 
-def run(candles: bool = False, since: str | None = None, db_path=None, batch_size: int = 25, pause: float = 0.25, hist_every: int = 1) -> None:
+def run(candles: bool = False, since: str | None = None, db_path=None, batch_size: int = 25, pause: float = 0.5, hist_every: int = 1) -> None:
     con = db.connect(db_path)
     s = session()
     min_close = None

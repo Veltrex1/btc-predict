@@ -36,7 +36,7 @@ class Predictor:
     def predict(self, rows: pd.DataFrame) -> np.ndarray:
         if self.kind == "baseline" or self.clf is None:
             return rows["p_bm"].to_numpy(dtype=float)
-        raw = self.clf.predict_proba(rows[FEATURES].to_numpy(dtype=np.float32))[:, 1]
+        raw = self.clf.predict_proba(rows[used_features(self.clf)].to_numpy(dtype=np.float32))[:, 1]
         return self.iso.predict(raw) if self.iso is not None else raw
 
     def save(self, path: str | Path = MODEL_PATH) -> None:
@@ -54,15 +54,22 @@ class Predictor:
             return pickle.load(f)
 
 
+def used_features(clf) -> list[str]:
+    return getattr(clf, "btc_features", FEATURES)
+
+
 def fit_gbm(train: pd.DataFrame, calib: pd.DataFrame | None, seed: int = 0) -> tuple:
+    # features with no data in this source (e.g. taker imbalance on Coinbase) are left out
+    cols = [f for f in FEATURES if train[f].notna().any()]
     clf = HistGradientBoostingClassifier(
         max_iter=400, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=200,
         l2_regularization=1.0, early_stopping=True, validation_fraction=0.1,
         n_iter_no_change=20, random_state=seed,
     )
-    clf.fit(train[FEATURES].to_numpy(dtype=np.float32), train["label"].to_numpy())
+    clf.fit(train[cols].to_numpy(dtype=np.float32), train["label"].to_numpy())
+    clf.btc_features = cols
     iso = None
     if calib is not None and len(calib) > 1000:
-        raw = clf.predict_proba(calib[FEATURES].to_numpy(dtype=np.float32))[:, 1]
+        raw = clf.predict_proba(calib[cols].to_numpy(dtype=np.float32))[:, 1]
         iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip").fit(raw, calib["label"].to_numpy())
     return clf, iso
