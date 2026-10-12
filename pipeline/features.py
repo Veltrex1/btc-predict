@@ -47,6 +47,8 @@ def minute_frame(bars: pd.DataFrame) -> pd.DataFrame:
     tv = taker.rolling(5, min_periods=1).sum()
     vv = vol.rolling(5, min_periods=1).sum()
     mf["taker_imb_5"] = (2 * tv / vv.where(vv > 0) - 1).to_numpy()
+    # share of the trailing day with no real bar (data holes); rows near holes are dropped in training
+    mf["gap_frac"] = b["close"].isna().rolling(1440, min_periods=1).mean().to_numpy()
     win = (mf.index - MIN).floor(f"{WINDOW_MIN}min")
     mf["win"] = win
     mf["hi_w"] = mf.groupby("win")["high"].cummax()
@@ -113,6 +115,7 @@ def rows_from_points(mf: pd.DataFrame, pts: pd.DataFrame, settle_mode: str = "av
     out["hour_cos"] = np.cos(2 * np.pi * hour / 24)
     out["dow"] = at.dayofweek.astype(float)
     out["price"] = P
+    out["gap_frac"] = j["gap_frac"].to_numpy()
     return out
 
 

@@ -22,6 +22,14 @@ interface WindowRow {
   locked_secs_left: number | null; result: string | null; yes_ask_at_lock: number | null; no_ask_at_lock: number | null;
 }
 
+interface Trade { ts: string; kind: string; side: string; count: number; price: number; fee: number; reason: string; ticker: string; cash_after: number }
+interface Portfolio {
+  mode: 'off' | 'shadow' | 'live'; allocation?: number; equity?: number; cash?: number; pnl?: number; stop_at?: number;
+  halted?: string | null; trade_until?: string; held?: { ticker: string; side: string; count: number; price: number } | null;
+  account?: { cash: number; portfolio_value: number; total: number } | null; last_error?: string | null;
+  trades?: Trade[]; trade_count?: number;
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────
 const usd = (n?: number | null) => n == null ? '–' : n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 const pct = (n?: number | null, d = 1) => n == null ? '–' : `${(n * 100).toFixed(d)}%`;
@@ -29,11 +37,19 @@ const cents = (n?: number | null) => n == null ? '–' : `${Math.round(n * 100)}
 const clock = (s?: number | null) => s == null ? '–' : `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 const et = (iso?: string) => iso ? new Date(iso + 'Z').toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }) : '–';
 
+// When the server is internet-facing it needs the API token: open the dashboard once with ?token=..., it is remembered.
+const TOKEN = (() => {
+  const t = new URLSearchParams(window.location.search).get('token');
+  try { if (t) localStorage.setItem('btc-token', t); return t ?? localStorage.getItem('btc-token') ?? ''; } catch { return t ?? ''; }
+})();
+const authed = (url: string, init: RequestInit = {}) =>
+  fetch(url, { ...init, headers: { ...(init.headers ?? {}), ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}) } });
+
 function usePoll<T>(url: string, ms: number): T | null {
   const [data, setData] = useState<T | null>(null);
   useEffect(() => {
     let alive = true;
-    const tick = () => fetch(url).then(r => r.json()).then(d => { if (alive) setData(d); }).catch(() => {});
+    const tick = () => authed(url).then(r => r.json()).then(d => { if (alive) setData(d); }).catch(() => {});
     tick();
     const id = setInterval(tick, ms);
     return () => { alive = false; clearInterval(id); };
@@ -125,11 +141,56 @@ function ProbChart({ snaps, tau, lockedSecsLeft }: { snaps: Snapshot[]; tau: num
   );
 }
 
+function PortfolioPanel({ pf }: { pf: Portfolio }) {
+  const [busy, setBusy] = useState(false);
+  const stop = () => { setBusy(true); authed('/trading/stop', { method: 'POST' }).finally(() => setBusy(false)); };
+  const pnl = pf.pnl ?? 0;
+  return (
+    <Panel title={`Bot · ${pf.mode === 'live' ? 'LIVE (real money)' : 'shadow (no real orders)'}`}>
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-5">
+        <Stat label="Bot equity" value={usd(pf.equity)} sub={`of ${usd(pf.allocation)} allocated`} />
+        <div>
+          <div className="text-xs text-[var(--ink-3)]">P&amp;L</div>
+          <div className="num font-mono text-lg" style={{ color: pnl >= 0 ? 'var(--above)' : 'var(--below)' }}>{pnl >= 0 ? '+' : ''}{usd(pnl)}</div>
+          <div className="num text-xs text-[var(--ink-2)]">stops at {usd(pf.stop_at)}</div>
+        </div>
+        <Stat label="Kalshi account (live)" value={usd(pf.account?.total)} sub={pf.account ? `cash ${usd(pf.account.cash)}` : 'no API key'} />
+        <Stat label="Holding" value={pf.held ? `${pf.held.count.toFixed(2)} ${pf.held.side.toUpperCase()}` : 'flat'} sub={pf.held ? `@ ${(pf.held.price * 100).toFixed(1)}¢` : undefined} />
+        <div>
+          <div className="text-xs text-[var(--ink-3)]">Status</div>
+          <div className="text-sm" style={{ color: pf.halted ? 'var(--below)' : 'var(--ink)' }}>{pf.halted ? `Halted: ${pf.halted}` : `Trading until ${pf.trade_until?.slice(11, 16)} UTC`}</div>
+          {!pf.halted && <button onClick={stop} disabled={busy} className="mt-1 rounded-md border border-[var(--below)] px-3 py-1 text-sm text-[var(--below)] hover:bg-[var(--below)] hover:text-black">Stop trading</button>}
+        </div>
+      </div>
+      {pf.last_error && <div className="mt-2 text-xs text-[var(--below)]">{pf.last_error}</div>}
+      <div className="mt-4 overflow-x-auto">
+        <table className="num w-full text-left font-mono text-sm">
+          <thead className="text-xs text-[var(--ink-3)]"><tr><th className="py-1 pr-4">time ET</th><th className="pr-4">action</th><th className="pr-4">contracts</th><th className="pr-4">price</th><th className="pr-4">fee</th><th className="pr-4">why</th><th>bot cash</th></tr></thead>
+          <tbody>
+            {(pf.trades ?? []).map((t, i) => (
+              <tr key={i} className="border-t border-[var(--line)]">
+                <td className="py-1 pr-4">{et(t.ts.slice(0, 19))}</td>
+                <td className="pr-4" style={{ color: t.kind === 'buy' ? 'var(--ink)' : t.kind === 'sell' ? 'var(--target)' : 'var(--ink-2)' }}>{t.kind} {t.side.toUpperCase()}</td>
+                <td className="pr-4">{t.count.toFixed(2)}</td>
+                <td className="pr-4">{(t.price * 100).toFixed(1)}¢</td>
+                <td className="pr-4">{(t.fee * 100).toFixed(2)}¢</td>
+                <td className="pr-4">{t.reason}</td>
+                <td>{usd(t.cash_after)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
+  );
+}
+
 // ─── page ────────────────────────────────────────────────────────────
 export default function App() {
   const sig = usePoll<Signal>('/signal', 1000);
   const series = usePoll<{ snapshots: Snapshot[]; bars: Bar[] }>('/series', 5000);
   const history = usePoll<WindowRow[]>('/history?limit=32', 15000);
+  const pf = usePoll<Portfolio>('/portfolio', 3000);
   const ok = sig?.status === 'ok';
   const month = sig?.month;
   const side = sig?.side;
@@ -174,6 +235,8 @@ export default function App() {
           <Stat label="Kalshi YES / NO ask" value={`${cents(sig?.yes_ask)} / ${cents(sig?.no_ask)}`} sub={sig?.yes_bid != null ? `YES bid ${cents(sig.yes_bid)}` : 'no quote'} />
         </Panel>
       </div>
+
+      {pf && pf.mode !== 'off' && <PortfolioPanel pf={pf} />}
 
       <div className="grid gap-4 md:grid-cols-2">
         <Panel title="Last hour (1-minute candles)"><Candles bars={series?.bars ?? []} target={sig?.target} price={sig?.price} /></Panel>

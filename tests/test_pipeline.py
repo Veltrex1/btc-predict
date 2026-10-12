@@ -77,17 +77,18 @@ def test_wilson():
 
 
 def test_fee():
-    assert fee_per_contract(0.5) == 0.02   # 0.0175 rounds up
-    assert fee_per_contract(0.9) == 0.01   # 0.0063 rounds up
-    assert fee_per_contract(0.99) == 0.01
+    assert fee_per_contract(0.5) == 0.0175
+    assert fee_per_contract(0.9) == 0.0063
+    assert fee_per_contract(0.99) == 0.0007  # 0.000693 rounds up to $0.0001
 
 
 def test_market_metrics_cost_and_pnl():
     calls = pd.DataFrame({"side": ["ABOVE", "BELOW"], "correct": [1, 0], "label": [1, 1],
                           "yes_bid": [0.80, 0.70], "yes_ask": [0.82, 0.72]})
     m = market_metrics(calls)
-    # ABOVE pays 0.82 + 0.02 fee, wins 1; BELOW pays 1-0.70=0.30 + 0.02 fee, loses
-    assert abs(m["total_pnl_1_contract"] - ((1 - 0.84) + (0 - 0.32))) < 1e-9
+    # ABOVE pays 0.82 + fee, wins 1; BELOW pays 1-0.70=0.30 + fee, loses
+    expected = (1 - 0.82 - fee_per_contract(0.82)) + (0 - 0.30 - fee_per_contract(0.30))
+    assert abs(m["total_pnl_1_contract"] - expected) < 1e-9
 
 
 def test_kalshi_parsing_cents_and_dollars():

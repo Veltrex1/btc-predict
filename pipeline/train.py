@@ -39,7 +39,7 @@ def build_dataset(bars: pd.DataFrame, markets: pd.DataFrame | None, settle_mode:
     mf = minute_frame(bars)
     windows = attach_kalshi(proxy_windows(bars, settle_mode), markets)
     rows = rows_from_points(mf, decision_points(windows), settle_mode)
-    rows = rows[np.isfinite(rows["sig_slow"]) & np.isfinite(rows["logret_target"])]
+    rows = rows[np.isfinite(rows["sig_slow"]) & np.isfinite(rows["logret_target"]) & (rows["gap_frac"] <= 0.02)]
     rows[FEATURES] = rows[FEATURES].astype(np.float32)
     return rows.reset_index(drop=True), disagreement(windows)
 

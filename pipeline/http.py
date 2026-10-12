@@ -14,7 +14,7 @@ def session() -> requests.Session:
     return s
 
 
-def get(s: requests.Session, url: str, params=None, retries: int = 6, timeout: float = 30.0,
+def get(s: requests.Session, url: str, params=None, retries: int = 10, timeout: float = 30.0,
         ok_404: bool = False) -> requests.Response | None:
     delay = 1.0
     for attempt in range(retries):
@@ -30,7 +30,7 @@ def get(s: requests.Session, url: str, params=None, retries: int = 6, timeout: f
             return None
         if r.status_code in (429, 500, 502, 503, 504):
             time.sleep(float(r.headers.get("Retry-After", delay)))
-            delay *= 2
+            delay = min(delay * 2, 30)
             continue
         r.raise_for_status()
         return r

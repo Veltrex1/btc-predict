@@ -102,6 +102,6 @@ def quote(m: dict) -> dict:
 
 
 def fee_per_contract(price: float) -> float:
-    """Kalshi taker fee for one contract: 0.07 * P * (1 - P), rounded up to the cent."""
-    import math
-    return math.ceil(round(0.07 * price * (1 - price) * 100, 6)) / 100.0
+    """Kalshi taker fee for one contract (see strategy.fee)."""
+    from .strategy import fee
+    return fee(1, price)

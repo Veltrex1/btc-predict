@@ -16,6 +16,8 @@ Endpoints: /signal (JSON), /swiftbar (menu-bar text), /history, /stats,
 from __future__ import annotations
 
 import asyncio
+import hmac
+import os
 import json
 import logging
 import sqlite3
@@ -29,9 +31,9 @@ import httpx
 import numpy as np
 import pandas as pd
 import websockets
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from pipeline.config import COINBASE_REST, COINBASE_WS, KALSHI_BASE, LIVE_DB_PATH, MODEL_PATH, ROOT, SERIES, WINDOW_MIN
@@ -403,9 +405,11 @@ def swiftbar_text(sig: dict, st: dict) -> str:
             lines.append(f"P&L at lock price, 1 contract: ${st['pnl_1_contract']:+.2f} | {font}")
     else:
         lines.append(f"{st['period']}: no settled calls yet | {font}")
+    base = os.environ.get("BTC_PUBLIC_URL", "http://127.0.0.1:8765")
+    tok = f"?token={os.environ['BTC_API_TOKEN']}" if os.environ.get("BTC_API_TOKEN") else ""
     lines += ["---",
               f"Open Kalshi market | href=https://kalshi.com/markets/{SERIES.lower()}",
-              "Open dashboard | href=http://127.0.0.1:8765/"]
+              f"Open dashboard | href={base}/{tok}"]
     return "\n".join(lines) + "\n"
 
 
@@ -419,19 +423,88 @@ async def tick_loop() -> None:
         await asyncio.sleep(1)
 
 
+TRADER_MODE = os.environ.get("TRADER_MODE", "off")  # off | shadow | live
+API_TOKEN = os.environ.get("BTC_API_TOKEN")          # required for every endpoint except /health when set
+TRADER = None
+
+
+def make_trader():
+    if TRADER_MODE not in ("shadow", "live"):
+        return None
+    from .kalshi_client import KalshiClient
+    from .trader import Config, Trader
+    client = KalshiClient.from_env() if (TRADER_MODE == "live" or os.environ.get("KALSHI_KEY_ID")) else None
+    if TRADER_MODE == "live":
+        open_pos = [p for p in client.positions() if p["ticker"].startswith(SERIES)]
+        if open_pos:
+            raise RuntimeError(f"refusing to start live: existing {SERIES} positions {open_pos}")
+    cfg = Config.load(TRADER_MODE, allocation=float(os.environ.get("TRADE_ALLOCATION", 10)),
+                      stop_loss=float(os.environ.get("TRADE_STOP_LOSS", 5)),
+                      hours=float(os.environ.get("TRADE_HOURS", 24)))
+    return Trader(cfg, client, LIVE_DB_PATH)
+
+
+async def trade_loop() -> None:
+    while True:
+        await asyncio.sleep(1)
+        if TRADER is None:
+            continue
+        await asyncio.to_thread(TRADER.tick, dict(S.signal), time.time() - S.price_ts if S.price_ts else 999)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global S
+    global S, TRADER
     S = State()
     log.info("model=%s tau=%.2f lead=%.0fs", S.model.kind, S.model.policy.tau, S.model.policy.min_lead_s)
-    tasks = [asyncio.create_task(f()) for f in (rest_loop, ws_loop, kalshi_loop, tick_loop)]
+    TRADER = make_trader()
+    if TRADER:
+        log.warning("TRADER %s: allocation $%.2f, stop at -$%.2f, params %s", TRADER.cfg.mode,
+                    TRADER.cfg.allocation, TRADER.cfg.stop_loss, TRADER.cfg.params)
+    tasks = [asyncio.create_task(f()) for f in (rest_loop, ws_loop, kalshi_loop, tick_loop, trade_loop)]
     yield
     for t in tasks:
         t.cancel()
 
 
 app = FastAPI(title="btc-predict", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    """When BTC_API_TOKEN is set (any internet-facing deploy), every endpoint but /health needs it,
+    as `Authorization: Bearer <token>` or `?token=<token>`."""
+    if API_TOKEN and request.url.path != "/health" and not request.url.path.startswith("/assets"):
+        given = request.headers.get("authorization", "").removeprefix("Bearer ").strip() or \
+            request.query_params.get("token", "")
+        page = request.url.path in ("/", "/index.html")
+        if not page and not hmac.compare_digest(given, API_TOKEN):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+@app.get("/portfolio")
+def get_portfolio() -> dict:
+    if TRADER is None:
+        return {"mode": "off"}
+    return TRADER.status()
+
+
+@app.post("/trading/stop")
+def trading_stop() -> dict:
+    if TRADER is None:
+        return {"mode": "off"}
+    TRADER.halt("stopped by user", dict(S.signal))
+    return TRADER.status()
+
+
+@app.post("/trading/start")
+def trading_start() -> dict:
+    if TRADER is None:
+        return {"mode": "off"}
+    TRADER.resume()
+    return TRADER.status()
 
 
 @app.get("/signal")
@@ -441,7 +514,42 @@ def get_signal() -> dict:
 
 @app.get("/swiftbar", response_class=PlainTextResponse)
 def get_swiftbar() -> str:
-    return swiftbar_text(S.signal, stats())
+    text = swiftbar_text(S.signal, stats())
+    if TRADER is None:
+        return text
+    return portfolio_swiftbar(text, TRADER.status())
+
+
+def portfolio_swiftbar(text: str, st: dict) -> str:
+    """Prefix the menu-bar title with live P&L and add a portfolio section with a stop button."""
+    green, red, gray = "#10b981", "#f43f5e", "#a3a3a3"
+    font = "font=Menlo size=12"
+    lines = text.rstrip("\n").split("\n")
+    title, rest = lines[0], lines[1:]
+    label, _, params = title.partition(" | ")
+    pnl = st["pnl"]
+    tag = "⏸" if st["halted"] else ("●" if st["mode"] == "live" else "◌")
+    lines = [f"{tag} {pnl:+.2f} {label} | {params}", "---"]
+    acct = st.get("account") or {}
+    lines.append(f"Bot ({st['mode']}): ${st['equity']:.2f} of ${st['allocation']:.2f}  P&L {pnl:+.2f} | "
+                 f"color={green if pnl >= 0 else red} {font}")
+    if acct:
+        lines.append(f"Kalshi account: ${acct['total']:.2f} (cash ${acct['cash']:.2f}) | {font}")
+    if st["held"]:
+        h = st["held"]
+        lines.append(f"Holding {h['count']:.2f} {h['side'].upper()} @ {h['price'] * 100:.1f}¢ | {font}")
+    lines.append(f"Trades: {st['trade_count']}   stop at ${st['stop_at']:.2f}   until {st['trade_until'][11:16]} UTC"
+                 f" | color={gray} {font}")
+    if st["halted"]:
+        lines.append(f"HALTED: {st['halted']} | color={red} {font}")
+    if st.get("last_error"):
+        lines.append(f"error: {st['last_error'][:80]} | color={red} {font}")
+    tok = f"?token={API_TOKEN}" if API_TOKEN else ""
+    base = os.environ.get("BTC_PUBLIC_URL", "http://127.0.0.1:8765")
+    if not st["halted"]:
+        lines.append(f"⏹ Stop trading now | bash=/usr/bin/curl param1=-s param2=-X param3=POST "
+                     f"param4={base}/trading/stop{tok} terminal=false refresh=true color={red}")
+    return "\n".join(lines + rest[1:]) + "\n"
 
 
 @app.get("/stats")

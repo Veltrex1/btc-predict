@@ -34,7 +34,8 @@ def test_signal_locks_and_reports(live):
     sig = appmod.compute_signal()
     assert sig["status"] == "ok" and sig["state"] == "LOCKED" and sig["side"] == "ABOVE"
     assert sig["target_source"] == "kalshi" and sig["prob_above"] > 0.9
-    assert sig["edge_above"] < 0  # paying 97c + fee for a ~99% outcome is no edge
+    from pipeline.kalshi import fee_per_contract
+    assert abs(sig["edge_above"] - (sig["prob_above"] - 0.97 - fee_per_contract(0.97))) < 1e-12
     # the lock never flips even if price collapses
     S.price = target * 0.99
     sig2 = appmod.compute_signal()
