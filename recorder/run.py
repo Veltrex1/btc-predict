@@ -48,6 +48,9 @@ CREATE INDEX IF NOT EXISTS brti_ts ON brti(source_ts);
 CREATE TABLE IF NOT EXISTS kalshi_ob (ts INTEGER, ticker TEXT, kind TEXT, side TEXT, price REAL, size REAL,
     levels TEXT, seq INTEGER, exch_ts INTEGER);
 CREATE INDEX IF NOT EXISTS kob_ts ON kalshi_ob(ts);
+CREATE TABLE IF NOT EXISTS pmus_book (ts INTEGER, slug TEXT, state TEXT, best_bid REAL, bid_sz REAL,
+    best_ask REAL, ask_sz REAL, bids TEXT, offers TEXT, last_px REAL, notional REAL);
+CREATE INDEX IF NOT EXISTS pmus_ts ON pmus_book(ts);
 CREATE TABLE IF NOT EXISTS deribit (ts INTEGER, instrument TEXT, mark REAL, index_price REAL, bid REAL, ask REAL,
     funding REAL, open_interest REAL);
 """
@@ -286,6 +289,47 @@ async def kalshi_ws() -> None:
             watcher.cancel()
 
 
+# ── Polymarket US (public order books; same BRTI 60 s settlement as Kalshi) ─────────
+PMUS = "https://gateway.polymarket.us/v1/markets"
+
+
+def pmus_slug(start: "datetime") -> str:
+    return start.strftime("cpc-btc-updown-15m-%Y-%m-%d-") + f"{start.hour:02d}{start.minute:02d}z"
+
+
+def parse_pmus(md: dict) -> tuple:
+    def lv(side):
+        return [(float(x["px"]["value"]), float(x["qty"])) for x in (md.get(side) or [])]
+    bids = sorted(lv("bids"), reverse=True)
+    offers = sorted(lv("offers"))
+    st = md.get("stats") or {}
+    last = (st.get("lastTradePx") or {}).get("value")
+    notional = (st.get("notionalTraded") or {}).get("value")
+    return (now_ms(), md.get("marketSlug"), md.get("state"),
+            bids[0][0] if bids else None, bids[0][1] if bids else None,
+            offers[0][0] if offers else None, offers[0][1] if offers else None,
+            json.dumps(bids[:5]), json.dumps(offers[:5]),
+            float(last) if last else None, float(notional) if notional else None)
+
+
+async def polymarket_us() -> None:
+    """Every second: order book of the current 15-minute BTC window and, near the boundary, the next one."""
+    from datetime import datetime, timedelta, timezone
+    async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "btc-predict-recorder"}) as c:
+        while True:
+            t0 = time.time()
+            now = datetime.now(timezone.utc)
+            start = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
+            slugs = [pmus_slug(start)]
+            if (start + timedelta(minutes=15) - now).total_seconds() < 120:
+                slugs.append(pmus_slug(start + timedelta(minutes=15)))
+            for slug in slugs:
+                r = await c.get(f"{PMUS}/{slug}/book")
+                if r.status_code == 200 and (md := r.json().get("marketData")):
+                    SINK.add("pmus_book", parse_pmus(md))
+            await asyncio.sleep(max(0.0, 1.0 - (time.time() - t0)))
+
+
 async def kalshi_results() -> None:
     """Fill in official results for recorded markets once they settle."""
     async with httpx.AsyncClient(timeout=10) as c:
@@ -321,7 +365,8 @@ async def main() -> None:
     global SINK
     SINK = Sink(DB)
     feeds = {"coinbase": coinbase, "kraken": kraken, "bitstamp": bitstamp, "gemini": gemini,
-             "deribit": deribit, "kalshi": kalshi, "kalshi_results": kalshi_results}
+             "deribit": deribit, "kalshi": kalshi, "kalshi_results": kalshi_results,
+             "polymarket_us": polymarket_us}
     if os.environ.get("KALSHI_KEY_ID") and os.environ.get("KALSHI_PRIVATE_KEY_PATH"):
         feeds["kalshi_ws"] = kalshi_ws
     else:
