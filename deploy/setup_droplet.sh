@@ -13,6 +13,12 @@ REPO="${REPO:-https://github.com/Veltrex1/btc-predict.git}"
 APP=/opt/btc-predict
 ETC=/etc/btc-predict
 
+# swap: training the model needs ~2-3 GB of memory at peak
+if ! swapon --show | grep -q /swapfile; then
+  fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
+  grep -q /swapfile /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
 apt-get update -qq
 apt-get install -y -qq git curl ufw debian-keyring debian-archive-keyring apt-transport-https gnupg nodejs npm
 if ! command -v caddy >/dev/null; then
@@ -23,9 +29,9 @@ fi
 id btc >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin btc
 if [ ! -d "$APP/.git" ]; then git clone --branch "$BRANCH" "$REPO" "$APP"; else git -C "$APP" pull --ff-only; fi
 chown -R btc:btc "$APP"
-sudo -u btc bash -c "curl -LsSf https://astral.sh/uv/install.sh | sh" >/dev/null
+sudo -u btc -H bash -c "curl -LsSf https://astral.sh/uv/install.sh | sh" >/dev/null
 UV=/home/btc/.local/bin/uv
-sudo -u btc bash -c "cd $APP && $UV sync -q && cd dashboard && npm install --silent --no-audit --no-fund && npm run build --silent"
+sudo -u btc -H bash -c "cd $APP && $UV sync -q && cd dashboard && npm install --silent --no-audit --no-fund && npm run build --silent"
 
 IP=$(curl -fsS https://api.ipify.org)
 HOST="$(echo "$IP" | tr . -).sslip.io"
@@ -92,10 +98,7 @@ done
 
 # one-time history for the model (runs in the background; ~1h): 3 years of Coinbase bars, then train
 if [ ! -f "$APP/models/model.pkl" ]; then
-  sudo -u btc nohup bash -c "cd $APP && $UV run python -m pipeline.backfill_coinbase --days 1095 && \
-    $UV run python -m pipeline.backfill_kalshi --candles --hist-every 6 && \
-    $UV run python -m pipeline.train --years 3 --test-months 11 && systemctl --no-block restart btc-predict || true" \
-    > "$APP/data/bootstrap.log" 2>&1 &
+  nohup bash "$APP/deploy/bootstrap.sh" > "$APP/data/bootstrap.log" 2>&1 &
 fi
 
 cat > /etc/caddy/Caddyfile <<CADDY
