@@ -68,3 +68,18 @@ def test_book_and_place_parsing(monkeypatch):
     f = c.place("T", "buy", "no", 2, 0.28)   # NO ask = 1 - 0.72
     assert calls[-1][2]["side"] == "ask" and calls[-1][2]["price"] == "0.7200"
     assert f.filled == 2.0 and abs(f.avg_price - 0.28) < 1e-9 and f.avg_fee == 0.0141
+
+
+def test_polymarket_us_signature_verifies():
+    import base64 as b64
+
+    from cryptography.hazmat.primitives import serialization
+    from server.polymarket_us_client import PolymarketUSClient
+    key = ed25519.Ed25519PrivateKey.generate()
+    raw = key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    secret = b64.b64encode(raw + key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+    c = PolymarketUSClient("kid", secret)
+    h = c.headers("GET", "/v1/portfolio/positions?x=1")
+    msg = h["X-PM-Timestamp"] + "GET" + "/v1/portfolio/positions"
+    key.public_key().verify(b64.b64decode(h["X-PM-Signature"]), msg.encode())
+    assert h["X-PM-Access-Key"] == "kid"
