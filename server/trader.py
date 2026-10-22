@@ -34,7 +34,7 @@ import requests
 from pipeline.config import DATA_DIR, KALSHI_BASE, ROOT
 from pipeline.strategy import Params, Position, Quote, decide, fee
 
-from .kalshi_client import Book, KalshiClient
+from .kalshi_client import Book, KalshiClient, public_book
 
 log = logging.getLogger("btc-trader")
 STOP_FILE = DATA_DIR / "STOP"
@@ -208,13 +208,7 @@ class Trader:
         if self.client is not None:
             b = self.client.book(ticker)
         else:  # shadow without credentials: the order book endpoint is public
-            r = self.public.get(f"{KALSHI_BASE}/markets/{ticker}/orderbook", params={"depth": 1}, timeout=5)
-            ob = r.json().get("orderbook_fp", {})
-            yes = [(float(p), float(q)) for p, q in ob.get("yes_dollars") or []]
-            no = [(float(p), float(q)) for p, q in ob.get("no_dollars") or []]
-            by, bn = (max(yes) if yes else None), (max(no) if no else None)
-            b = Book(by[0] if by else None, by[1] if by else 0.0,
-                     round(1 - bn[0], 4) if bn else None, bn[1] if bn else 0.0)
+            b = public_book(ticker, self.public)
         self.last_book = b
         return b
 

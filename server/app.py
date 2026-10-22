@@ -596,6 +596,11 @@ def get_research() -> dict:
             out["recorder"]["since"] = pd.Timestamp(row[0], unit="ms").isoformat() if row and row[0] else None
         finally:
             c.close()
+    from .arb_trader import summary as arb_summary
+    try:
+        out["arb"] = arb_summary()
+    except sqlite3.Error:
+        out["arb"] = None
     if TRADER is not None:
         st = TRADER.status()
         out["bot"] = {k: st[k] for k in ("mode", "equity", "pnl", "trade_count", "halted", "allocation")}

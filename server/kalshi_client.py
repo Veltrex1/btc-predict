@@ -79,6 +79,22 @@ def order_payload(ticker: str, kind: str, side: str, count: float, price: float)
     }
 
 
+def book_from_orderbook(ob: dict) -> Book:
+    """Top of book from an `orderbook_fp` payload (YES bids and NO bids, in dollars)."""
+    yes = [(float(p), float(q)) for p, q in ob.get("yes_dollars") or []]
+    no = [(float(p), float(q)) for p, q in ob.get("no_dollars") or []]
+    by = max(yes) if yes else None
+    bn = max(no) if no else None
+    return Book(yes_bid=by[0] if by else None, yes_bid_size=by[1] if by else 0.0,
+                yes_ask=round(1 - bn[0], 4) if bn else None, yes_ask_size=bn[1] if bn else 0.0)
+
+
+def public_book(ticker: str, session: requests.Session | None = None) -> Book:
+    """The order book endpoint is public, so shadow runs need no key."""
+    r = (session or requests).get(f"{KALSHI_BASE}/markets/{ticker}/orderbook", params={"depth": 1}, timeout=5)
+    return book_from_orderbook(r.json().get("orderbook_fp", {}))
+
+
 class KalshiClient:
     def __init__(self, key_id: str, private_key, base: str = KALSHI_BASE, timeout: float = 10.0):
         self.key_id = key_id
@@ -133,13 +149,8 @@ class KalshiClient:
         return out
 
     def book(self, ticker: str) -> Book:
-        ob = self._req("GET", f"/markets/{ticker}/orderbook", params={"depth": 1}).get("orderbook_fp", {})
-        yes = [(float(p), float(q)) for p, q in ob.get("yes_dollars") or []]
-        no = [(float(p), float(q)) for p, q in ob.get("no_dollars") or []]
-        by = max(yes) if yes else None
-        bn = max(no) if no else None
-        return Book(yes_bid=by[0] if by else None, yes_bid_size=by[1] if by else 0.0,
-                    yes_ask=round(1 - bn[0], 4) if bn else None, yes_ask_size=bn[1] if bn else 0.0)
+        return book_from_orderbook(self._req("GET", f"/markets/{ticker}/orderbook", params={"depth": 1})
+                                   .get("orderbook_fp", {}))
 
     def market(self, ticker: str) -> dict:
         return self._req("GET", f"/markets/{ticker}").get("market", {})

@@ -64,14 +64,60 @@ class PolymarketUSClient:
         return {"X-PM-Access-Key": self.key_id, "X-PM-Timestamp": ts, "X-PM-Signature": sig,
                 "Content-Type": "application/json"}
 
+    def _req(self, method: str, path: str, params=None, body=None, retries: int = 3) -> dict:
+        for attempt in range(retries):
+            r = self.s.request(method, self.base + path, params=params, json=body,
+                               headers=self.headers(method, path), timeout=self.timeout)
+            if r.status_code == 429 and attempt < retries - 1:
+                time.sleep(1.0 * 2 ** attempt)
+                continue
+            if r.status_code >= 400:
+                raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
+            return r.json() if r.content else {}
+        raise RuntimeError(f"{method} {path} rate limited")
+
     def get(self, path: str, params=None) -> dict:
-        r = self.s.get(self.base + path, params=params, headers=self.headers("GET", path), timeout=self.timeout)
-        if r.status_code >= 400:
-            raise RuntimeError(f"GET {path} -> {r.status_code}: {r.text[:300]}")
-        return r.json()
+        return self._req("GET", path, params=params)
 
     def positions(self) -> dict:
         return self.get("/v1/portfolio/positions")
+
+    def balance(self) -> dict:
+        """USD cash and buying power."""
+        b = next((x for x in self.get("/v1/account/balances").get("balances", []) if x.get("currency") == "USD"), {})
+        return {"cash": float(b.get("currentBalance") or 0), "buying_power": float(b.get("buyingPower") or 0)}
+
+    def place(self, slug: str, intent: str, yes_price: float, qty: float, preview: bool = False) -> dict:
+        """Immediate-or-cancel limit order. Prices always refer to the YES (Up) side, so buying Down at q
+        is intent ORDER_INTENT_BUY_SHORT at yes_price 1 - q. Returns {order_id, filled, avg_yes_price, fee, raw}."""
+        body = {"marketSlug": slug, "intent": intent, "type": "ORDER_TYPE_LIMIT",
+                "price": {"value": f"{yes_price:.2f}", "currency": "USD"}, "quantity": qty,
+                "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+                "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC"}
+        if preview:
+            return self._req("POST", "/v1/order/preview", body={"request": body})
+        r = self._req("POST", "/v1/orders", body={**body, "synchronousExecution": True, "maxBlockTime": "3"})
+        oid = r.get("id", "")
+        o = self.order(oid) if oid else {}
+        return {"order_id": oid, **fill_summary(o, r.get("executions") or []), "raw": {"create": r, "order": o}}
+
+    def order(self, order_id: str) -> dict:
+        return self.get(f"/v1/order/{order_id}").get("order", {})
+
+
+def fill_summary(order: dict, executions: list[dict]) -> dict:
+    """Filled quantity, average YES price and commission from an order (falling back to its executions)."""
+    filled = float(order.get("cumQuantity") or 0)
+    avg = (order.get("avgPx") or {}).get("value") if isinstance(order.get("avgPx"), dict) else order.get("avgPx")
+    if not filled and executions:
+        fills = [(float(e.get("lastShares") or 0), float((e.get("lastPx") or {}).get("value") or 0))
+                 for e in executions if e.get("type") in ("EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL")]
+        filled = sum(q for q, _ in fills)
+        avg = sum(q * p for q, p in fills) / filled if filled else None
+    fee = order.get("commissionNotionalTotalCollected")
+    fee = fee.get("value") if isinstance(fee, dict) else fee
+    return {"filled": filled, "avg_yes_price": float(avg) if avg not in (None, "") else None,
+            "fee": float(fee) if fee not in (None, "") else None}
 
 
 def public_book(slug: str) -> dict | None:

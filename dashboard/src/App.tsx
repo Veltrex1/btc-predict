@@ -35,7 +35,10 @@ interface Research {
   loop: { ts: string; results: LoopRow[] } | null;
   recorder: Record<string, number | string | null>;
   bot: { mode: string; equity: number; pnl: number; trade_count: number; halted: string | null; allocation: number } | null;
+  arb?: ({ mode: string; halted: string | null } & Partial<Record<'shadow' | 'live', ArbStats>>) | null;
 }
+
+interface ArbStats { attempts: number; hedged: number; unwound: number; avg_quoted_edge: number | null; pnl: number; settled: number; contracts: number }
 
 // ─── helpers ─────────────────────────────────────────────────────────
 const usd = (n?: number | null) => n == null ? '–' : n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
@@ -192,6 +195,20 @@ function PortfolioPanel({ pf }: { pf: Portfolio }) {
   );
 }
 
+function arbValue(a: Research['arb']): string {
+  if (!a) return 'off';
+  const s = a[a.mode === 'live' ? 'live' : 'shadow'];
+  if (a.halted) return `halted`;
+  return s ? `${a.mode} ${s.pnl >= 0 ? '+' : ''}${usd(s.pnl)}` : a.mode;
+}
+
+function arbSub(a: Research['arb']): string | undefined {
+  if (!a) return undefined;
+  if (a.halted) return a.halted;
+  const s = a[a.mode === 'live' ? 'live' : 'shadow'];
+  return s ? `${s.hedged}/${s.attempts} pairs hedged, ${s.settled} settled` : 'no attempts yet';
+}
+
 function ResearchPanel({ r }: { r: Research }) {
   const rec = r.recorder ?? {};
   const n = (k: string) => (typeof rec[k] === 'number' ? (rec[k] as number).toLocaleString('en-US') : '–');
@@ -204,13 +221,14 @@ function ResearchPanel({ r }: { r: Research }) {
           The loop has not finished a cycle in {Math.round(staleHours)} h, so these scores are stale. Check `journalctl -u btc-loop`.
         </p>
       )}
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-7">
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-8">
         <Stat label="Windows recorded" value={n('windows_settled')} sub={rec.since ? `since ${String(rec.since).slice(0, 10)}` : undefined} />
         <Stat label="Kalshi trades" value={n('kalshi_trades')} />
         <Stat label="Kalshi book snapshots" value={n('kalshi_book')} />
         <Stat label="Spot updates" value={n('spot')} />
         <Stat label="BRTI index ticks" value={n('brti')} sub={rec.brti ? 'settlement stream on' : 'needs Kalshi API key'} />
         <Stat label="Polymarket US books" value={n('pmus_book')} sub={rec.pmus_book ? 'arbitrage data on' : 'waiting for listed windows'} />
+        <Stat label="Arbitrage" value={arbValue(r.arb)} sub={arbSub(r.arb)} />
         <Stat label="Bot" value={r.bot ? `${r.bot.mode} ${r.bot.pnl >= 0 ? '+' : ''}${usd(r.bot.pnl)}` : 'off'} sub={r.bot ? `${r.bot.trade_count} trades` : undefined} />
       </div>
       <div className="mt-4 overflow-x-auto">
