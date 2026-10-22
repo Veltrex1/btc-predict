@@ -32,16 +32,39 @@ def pmus_fee(count: float, price: float) -> float:
     return PMUS_THETA * count * price * (1 - price)
 
 
-def load(db=DB) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+def load(db=DB, t0: int | None = None, t1: int | None = None,
+         mk: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Polymarket US books, Kalshi books and markets for [t0, t1) ms (bounded; the whole range if omitted)."""
+    from . import ticks
+    c = ticks.connect(db)
     try:
-        pm = pd.read_sql("SELECT ts, slug, best_bid, bid_sz, best_ask, ask_sz FROM pmus_book", c)
-    except Exception:  # noqa: BLE001 - table absent on older recorders
-        pm = pd.DataFrame(columns=["ts", "slug", "best_bid", "bid_sz", "best_ask", "ask_sz"])
-    kb = pd.read_sql("SELECT ts, ticker, yes_bid, yes_bid_sz, yes_ask, yes_ask_sz FROM kalshi_book", c)
-    mk = pd.read_sql("SELECT ticker, close_ts, target, result, expiration_value FROM kalshi_markets", c)
-    c.close()
-    return pm, kb, mk
+        t0 = 0 if t0 is None else t0
+        t1 = 2**62 if t1 is None else t1
+        mk = ticks.markets(c) if mk is None else mk
+        return ticks.pmus_book(c, t0, t1), ticks.kalshi_book(c, t0, t1), \
+            mk[["ticker", "close_ts", "target", "result", "expiration_value"]]
+    finally:
+        c.close()
+
+
+KEEP = ["ticker", "sec", "close_ts", "secs_left", "target", "expiration_value", "cost_a", "cost_b",
+        "edge_a", "edge_b", "edge", "size_a", "size_b"]
+
+
+def panel_all_days(db=DB, last_n: int | None = None) -> pd.DataFrame:
+    """The per-second arbitrage panel, built one day at a time (only the needed columns are kept)."""
+    from . import ticks
+    c = ticks.connect(db)
+    try:
+        ranges = list(ticks.by_day(c, last_n))
+    finally:
+        c.close()
+    parts = []
+    for t0, t1, _, mk in ranges:
+        d = panel(*load(db, t0, t1, mk))
+        if len(d):
+            parts.append(d[KEEP])
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
 def panel(pm: pd.DataFrame, kb: pd.DataFrame, mk: pd.DataFrame) -> pd.DataFrame:
@@ -104,7 +127,7 @@ def summary(d: pd.DataFrame) -> dict:
 
 
 def main() -> None:
-    d = panel(*load())
+    d = panel_all_days()
     for k, v in summary(d).items():
         print(f"{k}: {v}")
     t = first_trades(d)

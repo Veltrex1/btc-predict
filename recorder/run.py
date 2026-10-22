@@ -65,7 +65,7 @@ class Sink:
 
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
+        self.db = sqlite3.connect(path, timeout=120)  # wait out compaction batches instead of failing
         self.db.executescript(SCHEMA)
         self.buf: dict[str, list[tuple]] = {}
         self.counts: dict[str, int] = {}

@@ -21,7 +21,10 @@ from . import db
 from .config import DATA_DIR, KALSHI_BASE
 from .http import get, session
 
-OUT = DATA_DIR / "maker_trades.parquet"
+OUT = DATA_DIR / "maker_trades.parquet"      # legacy raw trades (migrated into AGG, then removed)
+AGG = DATA_DIR / "maker_agg.parquet"         # per window x price bin x time bin: contracts and summed P&L
+PBINS = [0.0, 0.02, 0.10, 0.30, 0.40, 0.60, 0.70, 0.90, 0.98, 1.0001]
+TBINS = [0.0, 0.25, 2.0, 5.0, 6.0, 14.0, 15.01]
 
 
 def fetch_trades(s, ticker: str) -> list[dict]:
@@ -38,26 +41,67 @@ def fetch_trades(s, ticker: str) -> list[dict]:
             return rows
 
 
+def aggregate(fills: pd.DataFrame) -> pd.DataFrame:
+    """Collapse maker fills (from maker_fills) to window x price bin x minutes-left bin."""
+    f = fills[(fills["mins_left"] > 0) & (fills["price"] > 0) & (fills["price"] < 1)]
+    if f.empty:
+        return pd.DataFrame(columns=["ticker", "close_time", "plo", "tlo", "contracts", "pnl_x", "fills"])
+    f = f.assign(plo=pd.cut(f["price"], PBINS, right=False, labels=PBINS[:-1]).astype(float),
+                 tlo=pd.cut(f["mins_left"], TBINS, right=False, labels=TBINS[:-1]).astype(float),
+                 pnl_x=f["pnl"] * f["count"])
+    return f.groupby(["ticker", "close_time", "plo", "tlo"], observed=True).agg(
+        contracts=("count", "sum"), pnl_x=("pnl_x", "sum"), fills=("count", "size")).reset_index()
+
+
+def migrate_raw() -> None:
+    """Fold a legacy raw-trades parquet into AGG in chunks (bounded memory), then delete it."""
+    if not OUT.exists():
+        return
+    import pyarrow.parquet as pq
+    parts = []
+    for batch in pq.ParquetFile(OUT).iter_batches(batch_size=500_000):
+        parts.append(aggregate(maker_fills(batch.to_pandas())))
+    agg = pd.concat(parts).groupby(["ticker", "close_time", "plo", "tlo"], as_index=False)[
+        ["contracts", "pnl_x", "fills"]].sum() if parts else pd.DataFrame()
+    if AGG.exists():
+        agg = pd.concat([pd.read_parquet(AGG), agg]).drop_duplicates(["ticker", "plo", "tlo"], keep="last")
+    agg.to_parquet(AGG)
+    OUT.unlink()
+    print(f"migrated raw trades into {AGG} ({agg['ticker'].nunique()} windows); removed {OUT}")
+
+
 def download(sample: int, since: str, seed: int = 0) -> None:
+    """Fetch trade history for `sample` more settled windows and store only the aggregated maker P&L."""
+    migrate_raw()
     con = db.connect(read_only=True)
     m = con.execute("SELECT ticker, close_time, target, result FROM kalshi_markets "
                     "WHERE result IN ('yes','no') AND close_time >= ?", [since]).df()
     con.close()
-    done = set(pd.read_parquet(OUT)["ticker"].unique()) if OUT.exists() else set()
-    todo = m[~m["ticker"].isin(done)].sample(n=min(sample, len(m)), random_state=seed)
+    old = pd.read_parquet(AGG) if AGG.exists() else pd.DataFrame()
+    done = set(old["ticker"].unique()) if len(old) else set()
+    todo = m[~m["ticker"].isin(done)]
+    todo = todo.sample(n=min(sample, len(todo)), random_state=seed) if len(todo) else todo
     s = session()
-    frames = [pd.read_parquet(OUT)] if OUT.exists() else []
+    new = []
     for i, row in enumerate(todo.itertuples(index=False)):
         tr = pd.DataFrame(fetch_trades(s, row.ticker))
         if tr.empty:
             continue
         tr["close_time"], tr["result"] = row.close_time, row.result
-        frames.append(tr[["ticker", "trade_id", "created_time", "yes_price_dollars", "count_fp",
-                          "taker_outcome_side", "close_time", "result"]])
-        if (i + 1) % 25 == 0:
-            pd.concat(frames).to_parquet(OUT)
+        new.append(aggregate(maker_fills(tr)))
+        if (i + 1) % 25 == 0 or i + 1 == len(todo):
+            pd.concat([old] + new).to_parquet(AGG)
             print(f"{i + 1}/{len(todo)} windows", flush=True)
-    pd.concat(frames).to_parquet(OUT)
+
+
+def range_pnl(agg: pd.DataFrame, lo: float, hi: float, tl: float, th: float) -> pd.DataFrame:
+    """Contract-weighted maker P&L per window for fills priced [lo, hi) with [tl, th) minutes left."""
+    g = agg[(agg.plo >= lo) & (agg.plo < hi) & (agg.tlo >= tl) & (agg.tlo < th)]
+    if g.empty:
+        return pd.DataFrame(columns=["pnl", "t"])
+    w = g.groupby("ticker").agg(pnl_x=("pnl_x", "sum"), contracts=("contracts", "sum"), t=("close_time", "first"))
+    w = w[w.contracts > 0]
+    return pd.DataFrame({"pnl": w.pnl_x / w.contracts, "t": w.t})
 
 
 def maker_fills(tr: pd.DataFrame) -> pd.DataFrame:
@@ -75,32 +119,20 @@ def maker_fills(tr: pd.DataFrame) -> pd.DataFrame:
 
 
 def analyze() -> None:
-    t = maker_fills(pd.read_parquet(OUT))
-    t = t[(t["mins_left"] > 0) & (t["price"] > 0.005) & (t["price"] < 0.995)]
-    print(f"{len(t):,} maker fills across {t['ticker'].nunique()} windows, "
-          f"{t['count'].sum():,.0f} contracts")
-    w = lambda g: pd.Series({"fills": len(g), "contracts": g["count"].sum(),  # noqa: E731
-                             "avg_price": np.average(g["price"], weights=g["count"]),
-                             "win_rate": np.average(g["win"], weights=g["count"]),
-                             "pnl_per_contract": np.average(g["pnl"], weights=g["count"]),
-                             "windows": g["ticker"].nunique()})
-    t["price_b"] = pd.cut(t["price"], [0, .1, .3, .5, .7, .8, .9, .95, 1])
-    t["time_b"] = pd.cut(t["mins_left"], [0, 1, 2, 5, 10, 15], labels=["<1m", "1-2m", "2-5m", "5-10m", "10-15m"])
+    migrate_raw()
+    if not AGG.exists():
+        print("no maker data yet")
+        return
+    agg = pd.read_parquet(AGG)
+    print(f"{agg['ticker'].nunique()} windows, {agg['contracts'].sum():,.0f} maker contracts")
+    t = agg.groupby(["tlo", "plo"]).agg(contracts=("contracts", "sum"), pnl_x=("pnl_x", "sum"),
+                                         windows=("ticker", "nunique")).reset_index()
+    t["pnl_per_contract"] = t.pnl_x / t.contracts
     pd.set_option("display.width", 200)
-    print("\nAll maker fills by price (contract-weighted):")
-    print(t.groupby("price_b", observed=True).apply(w, include_groups=False).round(4).to_string())
-    print("\nBy time left x price:")
-    print(t.groupby(["time_b", "price_b"], observed=True).apply(w, include_groups=False).round(4).to_string())
-
-    # the specific rule from the candle study: maker buys of the favourite (70-90c) with 6-14 min left
-    rule = t[(t["price"] >= 0.70) & (t["price"] <= 0.90) & (t["mins_left"] >= 6) & (t["mins_left"] <= 14)]
-    per_window = rule.groupby("ticker").apply(
-        lambda g: pd.Series({"pnl": np.average(g["pnl"], weights=g["count"]), "close": g["close_time"].iloc[0]}),
-        include_groups=False)
-    per_window["half"] = np.where(per_window["close"] < per_window["close"].median(), "first half", "second half")
-    print("\nRULE: maker buys of the favourite at 70-90c with 6-14 min left (one average per window):")
-    print(per_window.groupby("half")["pnl"].agg(["count", "mean", lambda x: x.std() / np.sqrt(len(x))])
-          .rename(columns={"<lambda_0>": "se"}).round(4).to_string())
+    print(t[["tlo", "plo", "windows", "contracts", "pnl_per_contract"]].round(4).to_string(index=False))
+    for lo, hi, tl, th in [(0.70, 0.90, 6, 14), (0.40, 0.60, 6, 14), (0.10, 0.30, 2, 5), (0.90, 0.98, 0.25, 2)]:
+        r = range_pnl(agg, lo, hi, tl, th)
+        print(f"{lo:.2f}-{hi:.2f} at {tl}-{th} min: {len(r)} windows, mean {r.pnl.mean() * 100:+.2f}c")
 
 
 def main() -> None:

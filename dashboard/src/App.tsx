@@ -196,8 +196,14 @@ function ResearchPanel({ r }: { r: Research }) {
   const rec = r.recorder ?? {};
   const n = (k: string) => (typeof rec[k] === 'number' ? (rec[k] as number).toLocaleString('en-US') : '–');
   const c = (v?: number | null) => (v == null ? '–' : `${v >= 0 ? '+' : ''}${(v * 100).toFixed(2)}¢`);
+  const staleHours = r.loop ? (Date.now() - Date.parse(r.loop.ts)) / 3_600_000 : null;
   return (
     <Panel title={`Research loop${r.loop ? ` · last run ${et(r.loop.ts.slice(0, 19))} ET` : ' · not run yet'}`}>
+      {staleHours != null && staleHours > 12 && (
+        <p className="mb-3 text-sm text-[var(--below)]">
+          The loop has not finished a cycle in {Math.round(staleHours)} h, so these scores are stale. Check `journalctl -u btc-loop`.
+        </p>
+      )}
       <div className="grid grid-cols-2 gap-4 md:grid-cols-7">
         <Stat label="Windows recorded" value={n('windows_settled')} sub={rec.since ? `since ${String(rec.since).slice(0, 10)}` : undefined} />
         <Stat label="Kalshi trades" value={n('kalshi_trades')} />

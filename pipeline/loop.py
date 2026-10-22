@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 import time
 import traceback
 from datetime import datetime, timezone
@@ -26,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from . import db
-from .config import DATA_DIR, REPORT_DIR
+from .config import DATA_DIR, REPORT_DIR, ROOT
 
 HISTORY = DATA_DIR / "loop_history.jsonl"
 LATEST = REPORT_DIR / "loop_latest.md"
@@ -71,40 +73,28 @@ def cand_taker_model() -> list[dict]:
 
 def cand_maker_fills() -> list[dict]:
     """Realized P&L of real maker fills (public trade history), by price band, contract-weighted per window."""
-    from .maker_study import OUT, maker_fills
-    if not OUT.exists():
+    from .maker_study import AGG, migrate_raw, range_pnl
+    migrate_raw()
+    if not AGG.exists():
         return []
-    t = maker_fills(pd.read_parquet(OUT))
-    t = t[(t.mins_left > 0.25) & (t.price > 0.02) & (t.price < 0.98)]
+    agg = pd.read_parquet(AGG)
     out = []
     for lo, hi, tl, th in [(0.70, 0.90, 6, 14), (0.40, 0.60, 6, 14), (0.10, 0.30, 2, 5), (0.90, 0.98, 0.25, 2)]:
-        g = t[(t.price >= lo) & (t.price < hi) & (t.mins_left >= tl) & (t.mins_left < th)]
-        if g.empty:
-            continue
-        per = g.groupby("ticker").apply(lambda x: pd.Series({
-            "pnl": np.average(x.pnl, weights=x["count"]), "t": x.close_time.iloc[0]}), include_groups=False)
-        out.append(score(per.pnl, per.t, f"maker fills {lo:.2f}-{hi:.2f} at {tl}-{th} min left"))
+        per = range_pnl(agg, lo, hi, tl, th)
+        if len(per):
+            out.append(score(per.pnl, per.t, f"maker fills {lo:.2f}-{hi:.2f} at {tl}-{th} min left"))
     return out
 
 
 def cand_micro() -> list[dict]:
-    """Second-level: taker when spot-implied fair value beats ask + fee by 2c (recorder data)."""
+    """Second-level: taker when spot-implied fair value beats ask + fee by 2c (recorder data, last 14 days)."""
     from . import micro
     if not micro.DB.exists():
         return []
-    p = micro.build_panel(micro.load())
-    from .strategy import fee
-    q = p[(p.secs_left > 20) & p.y.notna()].copy()
-    if q.empty:
+    t = micro.all_days(micro.micro_first_trades, last_n=14)
+    if t.empty:
         return []
-    q["ey"] = q.fair - q.yes_ask - q.yes_ask.map(lambda a: fee(1, a))
-    q["en"] = (1 - q.fair) - (1 - q.yes_bid) - q.yes_bid.map(lambda b: fee(1, 1 - b))
-    first = q[(q.ey > 0.02) | (q.en > 0.02)].sort_values("sec").drop_duplicates("ticker")
-    yes = first.ey >= first.en
-    cost = np.where(yes, first.yes_ask + first.yes_ask.map(lambda a: fee(1, a)),
-                    (1 - first.yes_bid) + first.yes_bid.map(lambda b: fee(1, 1 - b)))
-    win = np.where(yes, first.y, 1 - first.y)
-    return [score(pd.Series(win - cost), pd.to_datetime(first.close_ts, unit="ms"), "micro: spot fair value > ask+fee+2c")]
+    return [score(t.pnl, pd.to_datetime(t.close_ts, unit="ms"), "micro: spot fair value > ask+fee+2c")]
 
 
 def cand_final_minute() -> list[dict]:
@@ -112,10 +102,10 @@ def cand_final_minute() -> list[dict]:
     from . import micro
     if not micro.DB.exists():
         return []
-    d, br = micro.load(), micro.load_brti()
+    frame = micro.all_days(micro.final_minute_frame, with_spot=False)
     out = []
     for lo, hi in ((20, 60), (3, 20)):
-        t = micro.final_minute_trades(d, br, max_secs=hi, min_secs=lo)
+        t = micro.final_minute_trades(frame, max_secs=hi, min_secs=lo)
         if len(t):
             out.append(score(t.pnl, pd.to_datetime(t.close_ts, unit="ms"), f"final minute: taker {lo}-{hi}s left, edge > 2c"))
     return out
@@ -126,7 +116,7 @@ def cand_arb() -> list[dict]:
     from . import arb
     if not arb.DB.exists():
         return []
-    t = arb.first_trades(arb.panel(*arb.load()))
+    t = arb.first_trades(arb.panel_all_days())
     if t.empty:
         return []
     return [score(t.pnl, pd.to_datetime(t.close_ts, unit="ms"), "arb: Kalshi + Polymarket US pair < $1 after fees")]
@@ -135,33 +125,47 @@ def cand_arb() -> list[dict]:
 CANDIDATES = [cand_taker_model, cand_maker_fills, cand_micro, cand_final_minute, cand_arb]
 
 
-# ── data top-up ───────────────────────────────────────────────────────
-def refresh_data(maker_windows: int) -> None:
+# ── data top-up, compaction and isolation ─────────────────────────────────────
+def refresh_step(name: str, maker_windows: int) -> None:
     from . import backfill_coinbase, backfill_kalshi, maker_study
-    for name, fn in [("kalshi", lambda: backfill_kalshi.run(candles=True)),
-                     ("coinbase", lambda: backfill_coinbase.run(days=3)),
-                     ("maker trades", lambda: maker_study.download(maker_windows, "2026-08-12"))]:
-        try:
-            fn()
-        except Exception:  # noqa: BLE001
-            print(f"refresh {name} failed:\n{traceback.format_exc()}")
+    {"kalshi": lambda: backfill_kalshi.run(candles=True),
+     "coinbase": lambda: backfill_coinbase.run(days=3),
+     "maker": lambda: maker_study.download(maker_windows, "2026-08-12")}[name]()
+
+
+STEP_TIMEOUT = {"compact": 3 * 3600, "kalshi": 3600, "coinbase": 1800, "maker": 3600}
+CANDIDATE_TIMEOUT = 20 * 60
+
+
+def run_isolated(args: list[str], timeout: float) -> tuple[bool, str]:
+    """Run `python -m pipeline.loop <args>` in a child process so a slow or crashing step can't stall the cycle."""
+    try:
+        r = subprocess.run([sys.executable, "-m", "pipeline.loop", *args], capture_output=True, text=True,
+                           timeout=timeout, cwd=str(ROOT))
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout / 60:.0f} min"
+    return r.returncode == 0, (r.stdout or "") + (r.stderr or "")[-1500:]
 
 
 def cycle(refresh: bool, maker_windows: int) -> list[dict]:
-    if refresh:
-        refresh_data(maker_windows)
+    steps = ["compact"] + (["kalshi", "coinbase", "maker"] if refresh else [])
+    for step in steps:
+        ok, out = run_isolated(["--step", step, "--maker-windows", str(maker_windows)], STEP_TIMEOUT[step])
+        if not ok:
+            print(f"step {step} failed: {out[-500:]}", flush=True)
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     results = []
     for c in CANDIDATES:
-        try:
-            for r in c():
-                results.append({"ts": stamp, **r})
-        except Exception:  # noqa: BLE001
-            results.append({"ts": stamp, "candidate": c.__name__, "error": traceback.format_exc()[-500:]})
+        ok, out = run_isolated(["--candidate", c.__name__], CANDIDATE_TIMEOUT)
+        line = next((ln for ln in reversed(out.splitlines()) if ln.startswith("RESULT ")), None)
+        if ok and line:
+            results += [{"ts": stamp, **r} for r in json.loads(line[7:])]
+        else:
+            results.append({"ts": stamp, "candidate": c.__name__, "error": out[-500:] or "no output"})
     HISTORY.parent.mkdir(parents=True, exist_ok=True)
     with open(HISTORY, "a") as f:
         for r in results:
-            f.write(json.dumps(r) + "\n")
+            f.write(json.dumps(r, default=str) + "\n")
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     lines = [f"# Learning loop, {stamp}", "",
              "| candidate | windows | P&L/contract last 14d | prior 14d | t-stat | promote |",
@@ -175,7 +179,7 @@ def cycle(refresh: bool, maker_windows: int) -> list[dict]:
                      f"{r.get('t_stat', 0):.2f} | {'YES' if r.get('promote') else 'no'} |")
     LATEST.write_text("\n".join(lines) + "\n")
     (DATA_DIR / "loop_latest.json").write_text(json.dumps({"ts": stamp, "results": results}, default=str))
-    print("\n".join(lines))
+    print("\n".join(lines), flush=True)
     return results
 
 
@@ -185,7 +189,20 @@ def main() -> None:
     ap.add_argument("--every", type=float, default=6.0, help="hours between cycles")
     ap.add_argument("--no-refresh", action="store_true")
     ap.add_argument("--maker-windows", type=int, default=150, help="new windows of trade history per cycle")
+    ap.add_argument("--candidate", help=argparse.SUPPRESS)  # internal: run one candidate, print RESULT json
+    ap.add_argument("--step", help=argparse.SUPPRESS)       # internal: run one refresh/compact step
     args = ap.parse_args()
+    if args.candidate:
+        fn = {c.__name__: c for c in CANDIDATES}[args.candidate]
+        print("RESULT " + json.dumps(fn(), default=str), flush=True)
+        return
+    if args.step:
+        if args.step == "compact":
+            from recorder import compact
+            print(compact.run(), flush=True)
+        else:
+            refresh_step(args.step, args.maker_windows)
+        return
     while True:
         cycle(not args.no_refresh, args.maker_windows)
         if args.once:
