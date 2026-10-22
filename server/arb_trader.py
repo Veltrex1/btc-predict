@@ -541,14 +541,20 @@ def probe_order(pm: PolymarketUSClient | None) -> None:
         print("Polymarket credentials missing")
         return
     http = requests.Session()
-    m = current_market(http)
-    secs = (m["close_ts"] - time.time() * 1000) / 1000 if m else 0
-    if not m or secs < 120:
-        print("need an open window with at least 2 minutes left; run again in a moment")
-        return
-    pb = pm_book_from(pm_public_book(m["slug"]))
-    if not pb or pb.best_ask is None or pb.best_bid is None:
-        print("no Polymarket book right now; try again")
+    deadline = time.time() + 15 * 60
+    m = pb = None
+    while time.time() < deadline:  # Polymarket lists windows irregularly: wait for one with a two-sided book
+        m = current_market(http)
+        secs = (m["close_ts"] - time.time() * 1000) / 1000 if m else 0
+        pb = pm_book_from(pm_public_book(m["slug"])) if m and secs >= 120 else None
+        if pb and pb.best_ask is not None and pb.best_bid is not None:
+            break
+        print(f"{datetime.now(UTC):%H:%M:%S} UTC: waiting for a Polymarket US window with prices "
+              f"(current: {m['slug'] if m else 'none'}, {'not listed' if m and secs >= 120 and not pb else 'too late or one-sided'})",
+              flush=True)
+        time.sleep(15)
+    else:
+        print("no usable Polymarket window within 15 minutes; try again later")
         return
     print(f"window {m['slug']}, book bid {pb.best_bid} / ask {pb.best_ask}; cash before {pm.balance()['cash']:.2f}")
     try:
