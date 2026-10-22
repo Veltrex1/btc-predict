@@ -85,6 +85,14 @@ def pmus_book(c: sqlite3.Connection, t0: int, t1: int) -> pd.DataFrame:
                        c, params=(t0, t1))
 
 
+def pmus_results(c: sqlite3.Connection, t0: int, t1: int) -> pd.DataFrame:
+    """Polymarket US settlements (settle_px = 1.0 when Up won) for windows closing in [t0, t1)."""
+    if not has_table(c, "pmus_results"):
+        return pd.DataFrame(columns=["slug", "settle_px"])
+    return pd.read_sql("SELECT slug, settle_px FROM pmus_results WHERE close_ts >= ? AND close_ts < ? "
+                       "AND settle_px IS NOT NULL", c, params=(t0, t1))
+
+
 def by_day(c: sqlite3.Connection, last_n: int | None = None, lookback_ms: int = WINDOW_MS + 60_000) \
         -> Iterator[tuple[int, int, int, pd.DataFrame]]:
     """For each day: (data_from, data_to, day_start, markets closing that day). Data starts `lookback_ms`

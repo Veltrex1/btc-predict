@@ -51,6 +51,7 @@ CREATE INDEX IF NOT EXISTS kob_ts ON kalshi_ob(ts);
 CREATE TABLE IF NOT EXISTS pmus_book (ts INTEGER, slug TEXT, state TEXT, best_bid REAL, bid_sz REAL,
     best_ask REAL, ask_sz REAL, bids TEXT, offers TEXT, last_px REAL, notional REAL);
 CREATE INDEX IF NOT EXISTS pmus_ts ON pmus_book(ts);
+CREATE TABLE IF NOT EXISTS pmus_results (slug TEXT PRIMARY KEY, close_ts INTEGER, state TEXT, settle_px REAL);
 CREATE TABLE IF NOT EXISTS deribit (ts INTEGER, instrument TEXT, mark REAL, index_price REAL, bid REAL, ask REAL,
     funding REAL, open_interest REAL);
 """
@@ -78,7 +79,7 @@ class Sink:
             if rows:
                 ph = ",".join("?" * len(rows[0]))
                 verb = "INSERT OR IGNORE" if table in ("kalshi_trades",) else \
-                    "INSERT OR REPLACE" if table == "kalshi_markets" else "INSERT"
+                    "INSERT OR REPLACE" if table in ("kalshi_markets", "pmus_results") else "INSERT"
                 self.db.executemany(f"{verb} INTO {table} VALUES ({ph})", rows)
                 self.counts[table] = self.counts.get(table, 0) + len(rows)
         self.db.commit()
@@ -330,6 +331,29 @@ async def polymarket_us() -> None:
             await asyncio.sleep(max(0.0, 1.0 - (time.time() - t0)))
 
 
+def pmus_settle(md: dict) -> float | None:
+    """Settlement price of the Up outcome (1.0 = Up won) from an expired Polymarket US book, else None."""
+    v = ((md.get("stats") or {}).get("settlementPx") or {}).get("value")
+    return float(v) if v is not None and md.get("state") == "MARKET_STATE_EXPIRED" else None
+
+
+async def pmus_results() -> None:
+    """Fill in Polymarket US settlements for windows that closed in the last two days."""
+    from datetime import datetime, timezone
+    async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "btc-predict-recorder"}) as c:
+        while True:
+            rows = SINK.db.execute(
+                "SELECT close_ts FROM kalshi_markets WHERE close_ts < ? AND close_ts > ? AND "
+                "close_ts NOT IN (SELECT close_ts FROM pmus_results WHERE settle_px IS NOT NULL) ORDER BY close_ts DESC",
+                (now_ms() - 60_000, now_ms() - 2 * 86_400_000)).fetchall()
+            for (close_ts,) in rows[:20]:
+                slug = pmus_slug(datetime.fromtimestamp(close_ts / 1000 - 900, tz=timezone.utc))
+                r = await c.get(f"{PMUS}/{slug}/book")
+                if r.status_code == 200 and (md := r.json().get("marketData")) and (px := pmus_settle(md)) is not None:
+                    SINK.add("pmus_results", (slug, close_ts, md.get("state"), px))
+            await asyncio.sleep(60)
+
+
 async def kalshi_results() -> None:
     """Fill in official results for recorded markets once they settle."""
     async with httpx.AsyncClient(timeout=10) as c:
@@ -366,7 +390,7 @@ async def main() -> None:
     SINK = Sink(DB)
     feeds = {"coinbase": coinbase, "kraken": kraken, "bitstamp": bitstamp, "gemini": gemini,
              "deribit": deribit, "kalshi": kalshi, "kalshi_results": kalshi_results,
-             "polymarket_us": polymarket_us}
+             "polymarket_us": polymarket_us, "pmus_results": pmus_results}
     if os.environ.get("KALSHI_KEY_ID") and os.environ.get("KALSHI_PRIVATE_KEY_PATH"):
         feeds["kalshi_ws"] = kalshi_ws
     else:

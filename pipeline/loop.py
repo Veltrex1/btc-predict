@@ -112,14 +112,21 @@ def cand_final_minute() -> list[dict]:
 
 
 def cand_arb() -> list[dict]:
-    """Kalshi vs Polymarket US: buy both sides when the pair costs < $1 after both taker fees."""
+    """Kalshi vs Polymarket US: buy both sides when the pair costs < $1 after both taker fees.
+    Scored on realised payouts from both venues' results, with and without a 1 s fill delay."""
     from . import arb
     if not arb.DB.exists():
         return []
-    t = arb.first_trades(arb.panel_all_days())
-    if t.empty:
-        return []
-    return [score(t.pnl, pd.to_datetime(t.close_ts, unit="ms"), "arb: Kalshi + Polymarket US pair < $1 after fees")]
+    d = arb.panel_all_days()
+    out = []
+    for delay, label in ((0, "arb: Kalshi + Polymarket US pair < $1 after fees"), (1, "arb, filled 1 s later")):
+        t = arb.first_trades(d, delay=delay).dropna(subset=["pnl"])
+        if t.empty:
+            continue
+        r = score(t.pnl, pd.to_datetime(t.close_ts, unit="ms"), label)
+        r["note"] = f"{int((t.payout != 1).sum())} of {len(t)} pairs settled differently on the two venues"
+        out.append(r)
+    return out
 
 
 CANDIDATES = [cand_taker_model, cand_maker_fills, cand_micro, cand_final_minute, cand_arb]
@@ -177,6 +184,8 @@ def cycle(refresh: bool, maker_windows: int) -> list[dict]:
         f = lambda v: "" if v is None else f"{v * 100:+.2f}¢"  # noqa: E731
         lines.append(f"| {r['candidate']} | {r['windows']} | {f(r.get('pnl_recent'))} | {f(r.get('pnl_prior'))} | "
                      f"{r.get('t_stat', 0):.2f} | {'YES' if r.get('promote') else 'no'} |")
+    notes = [f"- {r['candidate']}: {r['note']}" for r in results if r.get("note")]
+    lines += [""] + notes if notes else []
     LATEST.write_text("\n".join(lines) + "\n")
     (DATA_DIR / "loop_latest.json").write_text(json.dumps({"ts": stamp, "results": results}, default=str))
     print("\n".join(lines), flush=True)
