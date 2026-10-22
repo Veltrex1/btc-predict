@@ -644,7 +644,7 @@ def get_research() -> dict:
     if ticks.exists():
         c = sqlite3.connect(f"file:{ticks}?mode=ro", uri=True, timeout=2)
         try:
-            for t in ("spot", "kalshi_book", "kalshi_trades", "deribit", "brti", "kalshi_ob", "pmus_book"):
+            for t in ("spot", "kalshi_book", "kalshi_trades", "deribit", "brti", "kalshi_ob", "pmus_book", "pmus_ws"):
                 try:  # max(rowid) is instant even on huge tables
                     out["recorder"][t] = c.execute(f"SELECT max(rowid) FROM {t}").fetchone()[0] or 0
                 except sqlite3.Error:

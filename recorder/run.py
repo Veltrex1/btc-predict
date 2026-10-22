@@ -27,6 +27,7 @@ import httpx
 import websockets
 
 from pipeline.config import DATA_DIR, KALSHI_BASE, SERIES
+from recorder.pmus_ws import PMBookFeed, pmus_slug  # noqa: F401  (pmus_slug is re-exported)
 
 log = logging.getLogger("recorder")
 DB = Path(DATA_DIR) / "ticks.sqlite"
@@ -51,6 +52,12 @@ CREATE INDEX IF NOT EXISTS kob_ts ON kalshi_ob(ts);
 CREATE TABLE IF NOT EXISTS pmus_book (ts INTEGER, slug TEXT, state TEXT, best_bid REAL, bid_sz REAL,
     best_ask REAL, ask_sz REAL, bids TEXT, offers TEXT, last_px REAL, notional REAL);
 CREATE INDEX IF NOT EXISTS pmus_ts ON pmus_book(ts);
+-- real-time Polymarket US books from the authenticated WebSocket (pmus_book above is the 30 s cached REST copy)
+CREATE TABLE IF NOT EXISTS pmus_ws (ts INTEGER, slug TEXT, state TEXT, best_bid REAL, bid_sz REAL, best_ask REAL,
+    ask_sz REAL, exch_ts INTEGER);
+CREATE INDEX IF NOT EXISTS pmus_ws_ts ON pmus_ws(ts);
+CREATE TABLE IF NOT EXISTS pmus_trades (ts INTEGER, slug TEXT, price REAL, qty REAL, taker_intent TEXT, trade_ts INTEGER);
+CREATE INDEX IF NOT EXISTS pmus_trades_ts ON pmus_trades(ts);
 CREATE TABLE IF NOT EXISTS pmus_results (slug TEXT PRIMARY KEY, close_ts INTEGER, state TEXT, settle_px REAL);
 CREATE TABLE IF NOT EXISTS deribit (ts INTEGER, instrument TEXT, mark REAL, index_price REAL, bid REAL, ask REAL,
     funding REAL, open_interest REAL);
@@ -294,10 +301,6 @@ async def kalshi_ws() -> None:
 PMUS = "https://gateway.polymarket.us/v1/markets"
 
 
-def pmus_slug(start: "datetime") -> str:
-    return start.strftime("cpc-btc-updown-15m-%Y-%m-%d-") + f"{start.hour:02d}{start.minute:02d}z"
-
-
 def parse_pmus(md: dict) -> tuple:
     def lv(side):
         return [(float(x["px"]["value"]), float(x["qty"])) for x in (md.get(side) or [])]
@@ -335,6 +338,16 @@ def pmus_settle(md: dict) -> float | None:
     """Settlement price of the Up outcome (1.0 = Up won) from an expired Polymarket US book, else None."""
     v = ((md.get("stats") or {}).get("settlementPx") or {}).get("value")
     return float(v) if v is not None and md.get("state") == "MARKET_STATE_EXPIRED" else None
+
+
+async def polymarket_ws() -> None:
+    """Real-time Polymarket US books (changes only) and trades from the authenticated Markets WebSocket."""
+    from server.polymarket_us_client import private_key_from_secret
+    feed = PMBookFeed(
+        os.environ["POLYMARKET_KEY_ID"].strip(), private_key_from_secret(os.environ["POLYMARKET_SECRET_KEY"]),
+        on_book=lambda b: SINK.add("pmus_ws", (b.recv_ts, b.slug, b.state, b.bid, b.bid_sz, b.ask, b.ask_sz, b.exch_ts)),
+        on_trade=lambda t: SINK.add("pmus_trades", (t.recv_ts, t.slug, t.price, t.qty, t.taker_intent, t.trade_ts)))
+    await feed.run_once()
 
 
 async def pmus_results() -> None:
@@ -391,6 +404,12 @@ async def main() -> None:
     feeds = {"coinbase": coinbase, "kraken": kraken, "bitstamp": bitstamp, "gemini": gemini,
              "deribit": deribit, "kalshi": kalshi, "kalshi_results": kalshi_results,
              "polymarket_us": polymarket_us, "pmus_results": pmus_results}
+    if os.environ.get("PMUS_REST_POLL", "1") == "0":
+        feeds.pop("polymarket_us")  # the cached REST book is only kept to measure how stale it is
+    if os.environ.get("POLYMARKET_KEY_ID") and os.environ.get("POLYMARKET_SECRET_KEY"):
+        feeds["polymarket_ws"] = polymarket_ws
+    else:
+        log.info("no Polymarket US key configured: real-time Polymarket books disabled")
     if os.environ.get("KALSHI_KEY_ID") and os.environ.get("KALSHI_PRIVATE_KEY_PATH"):
         feeds["kalshi_ws"] = kalshi_ws
     else:

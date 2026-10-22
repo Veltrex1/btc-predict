@@ -117,6 +117,9 @@ def cand_arb() -> list[dict]:
     if not arb.DB.exists():
         return []
     d = arb.panel_all_days()
+    if d.empty:  # the public REST book is a 30 s cached copy, so only the real-time recorder's data counts
+        return [{"candidate": "arb: waiting for real-time Polymarket data (recorder WebSocket)", "windows": 0,
+                 "promote": False}]
     out = []
     for delay, label in ((0, "arb: Kalshi + Polymarket US pair < $1 after fees"), (1, "arb, filled 1 s later")):
         t = arb.first_trades(d, delay=delay).dropna(subset=["pnl"])

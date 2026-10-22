@@ -214,6 +214,7 @@ function arbSub(a: Research['arb']): string | undefined {
   if (!a) return undefined;
   if (a.halted) return a.halted;
   const s = a.live ?? a.shadow;
+  if (!a.live) return 'shadow numbers invalid (stale prices)';
   return s ? `${s.hedged}/${s.attempts} pairs hedged, ${s.settled} settled` : 'no attempts yet';
 }
 
@@ -235,7 +236,7 @@ function ResearchPanel({ r }: { r: Research }) {
         <Stat label="Kalshi book snapshots" value={n('kalshi_book')} />
         <Stat label="Spot updates" value={n('spot')} />
         <Stat label="BRTI index ticks" value={n('brti')} sub={rec.brti ? 'settlement stream on' : 'needs Kalshi API key'} />
-        <Stat label="Polymarket US books" value={n('pmus_book')} sub={rec.pmus_book ? 'arbitrage data on' : 'waiting for listed windows'} />
+        <Stat label="Polymarket US live updates" value={n('pmus_ws')} sub={rec.pmus_ws ? 'real-time feed on' : 'waiting for the real-time feed'} />
         <Stat label="Arbitrage" value={arbValue(r.arb)} sub={arbSub(r.arb)} />
         <Stat label="Bot" value={r.bot ? `${r.bot.mode} ${r.bot.pnl >= 0 ? '+' : ''}${usd(r.bot.pnl)}` : 'off'} sub={r.bot ? `${r.bot.trade_count} trades` : undefined} />
       </div>
@@ -271,7 +272,7 @@ function AccountBar({ b }: { b: Balances }) {
   const r = a.running?.find(x => x.mode === 'live') ?? a.running?.[0];
   const stale = r?.mode === 'live' && r.age_s > 120;   // the trading Mac is asleep or offline
   const what = r ? `${r.source} ${r.mode}${r.mode === 'live' ? `, seen ${Math.round(r.age_s)}s ago` : ', no real orders'}`
-    : a.real ? 'real money' : a.mode === 'shadow' ? 'shadow, no real orders' : a.mode;
+    : a.real ? 'real money' : 'shadow numbers invalid (stale prices)';
   return (
     <Panel grid="grid grid-cols-2 gap-4 md:grid-cols-5">
       <Stat label="Kalshi" value={b.kalshi != null ? usd(b.kalshi) : b.kalshi_error ? 'error' : '–'} sub={b.kalshi == null ? b.kalshi_error : undefined} />

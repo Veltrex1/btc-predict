@@ -85,6 +85,15 @@ def pmus_book(c: sqlite3.Connection, t0: int, t1: int) -> pd.DataFrame:
                        c, params=(t0, t1))
 
 
+def pmus_live(c: sqlite3.Connection, t0: int, t1: int) -> pd.DataFrame:
+    """Real-time Polymarket US top of book (one row per change) from the WebSocket recorder.
+    Unlike `pmus_book` (the 30 s cached REST copy) these are the prices an order would actually meet."""
+    cols = ["ts", "slug", "state", "best_bid", "bid_sz", "best_ask", "ask_sz"]
+    if not has_table(c, "pmus_ws"):
+        return pd.DataFrame(columns=cols)
+    return pd.read_sql(f"SELECT {', '.join(cols)} FROM pmus_ws WHERE ts >= ? AND ts < ?", c, params=(t0, t1))
+
+
 def pmus_results(c: sqlite3.Connection, t0: int, t1: int) -> pd.DataFrame:
     """Polymarket US settlements (settle_px = 1.0 when Up won) for windows closing in [t0, t1)."""
     if not has_table(c, "pmus_results"):

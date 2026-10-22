@@ -9,7 +9,7 @@ def test_arb_edge_and_slug_join():
     mk = pd.DataFrame([{"ticker": "K1", "close_ts": close, "target": 100.0, "result": "yes", "expiration_value": 101.0}])
     sec_ms = close - 300_000
     kb = pd.DataFrame([{"ts": sec_ms, "ticker": "K1", "yes_bid": 0.47, "yes_bid_sz": 50, "yes_ask": 0.48, "yes_ask_sz": 40}])
-    pm = pd.DataFrame([{"ts": sec_ms + 200, "slug": "cpc-btc-updown-15m-2026-10-12-0445z",
+    pm = pd.DataFrame([{"ts": sec_ms - 200, "slug": "cpc-btc-updown-15m-2026-10-12-0445z",
                         "best_bid": 0.55, "bid_sz": 30, "best_ask": 0.56, "ask_sz": 20}])
     d = arb.panel(pm, kb, mk)
     assert len(d) == 1
@@ -33,8 +33,9 @@ def _two_seconds(pm_up, second_bid=0.55):
     kb = pd.DataFrame([{"ts": t + i * 1000, "ticker": "K1", "yes_bid": 0.47, "yes_bid_sz": 50, "yes_ask": 0.48,
                         "yes_ask_sz": 40} for i in range(2)])
     slug = "cpc-btc-updown-15m-2026-10-12-0445z"
-    pm = pd.DataFrame([{"ts": t + 200, "slug": slug, "best_bid": 0.55, "bid_sz": 30, "best_ask": 0.56, "ask_sz": 20},
-                       {"ts": t + 1200, "slug": slug, "best_bid": second_bid, "bid_sz": 30, "best_ask": 0.56,
+    # real-time updates: each Kalshi sample (t, t+1000) is paired with the last update at or before it
+    pm = pd.DataFrame([{"ts": t - 200, "slug": slug, "best_bid": 0.55, "bid_sz": 30, "best_ask": 0.56, "ask_sz": 20},
+                       {"ts": t + 800, "slug": slug, "best_bid": second_bid, "bid_sz": 30, "best_ask": 0.56,
                         "ask_sz": 20}])
     res = pd.DataFrame([{"slug": slug, "settle_px": pm_up}])
     return arb.panel(pm, kb, mk, res)
@@ -66,3 +67,48 @@ def test_gap_that_vanishes_next_second_is_not_traded():
 def test_unknown_polymarket_result_leaves_pnl_blank():
     d = _two_seconds(pm_up=float("nan"))
     assert arb.first_trades(d).pnl.isna().all()
+
+
+def _book(ts, bid, ask, state="MARKET_STATE_OPEN", slug="cpc-btc-updown-15m-2026-10-12-0445z"):
+    return {"ts": ts, "slug": slug, "state": state, "best_bid": bid, "bid_sz": 30, "best_ask": ask, "ask_sz": 20}
+
+
+def _kalshi(ts):
+    return {"ts": ts, "ticker": "K1", "yes_bid": 0.47, "yes_bid_sz": 50, "yes_ask": 0.48, "yes_ask_sz": 40}
+
+
+def _mk():
+    close = int(pd.Timestamp("2026-10-12 05:00", tz="UTC").timestamp() * 1000)
+    return close, pd.DataFrame([{"ticker": "K1", "close_ts": close, "target": 1.0, "result": "yes",
+                                 "expiration_value": 1.0}])
+
+
+def test_quote_stays_valid_between_updates_and_reports_its_age():
+    close, mk = _mk()
+    t = close - 300_000
+    pm = pd.DataFrame([_book(t - 40_000, 0.55, 0.56)])      # one update, 40 s before the Kalshi sample, nothing since
+    d = arb.panel(pm, pd.DataFrame([_kalshi(t)]), mk)
+    assert len(d) == 1 and d.iloc[0].pm_age_s == 40 and d.iloc[0].best_bid == 0.55
+
+
+def test_polymarket_update_after_the_kalshi_sample_is_never_used():
+    close, mk = _mk()
+    t = close - 300_000
+    pm = pd.DataFrame([_book(t + 1, 0.55, 0.56)])
+    assert arb.panel(pm, pd.DataFrame([_kalshi(t)]), mk).empty
+
+
+def test_quotes_older_than_two_minutes_and_expired_markets_are_dropped():
+    close, mk = _mk()
+    t = close - 300_000
+    assert arb.panel(pd.DataFrame([_book(t - 121_000, 0.55, 0.56)]), pd.DataFrame([_kalshi(t)]), mk).empty
+    assert arb.panel(pd.DataFrame([_book(t - 1000, 0.55, 0.56, state="MARKET_STATE_EXPIRED")]),
+                     pd.DataFrame([_kalshi(t)]), mk).empty
+
+
+def test_each_window_uses_its_own_polymarket_book():
+    close, mk = _mk()
+    t = close - 300_000
+    other = _book(t - 100, 0.20, 0.21, slug="cpc-btc-updown-15m-2026-10-12-0500z")
+    d = arb.panel(pd.DataFrame([other, _book(t - 500, 0.55, 0.56)]), pd.DataFrame([_kalshi(t)]), mk)
+    assert d.iloc[0].best_bid == 0.55

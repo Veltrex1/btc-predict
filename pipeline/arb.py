@@ -15,9 +15,11 @@ tick, so a near-tie can settle differently on the two venues and the pair then
 pays $0 or $2. P&L is therefore realised from both venues' actual results
 (Polymarket's from `pmus_results`), not assumed to be $1.
 
-The recorder sees each book once a second, so a gap can be one venue's stale
-quote. `first_trades(delay=1)` acts on a gap at second t but fills at second
-t+1's prices, and only if the gap is still there.
+Polymarket prices come from the real-time WebSocket recorder (`pmus_ws`), never from the public REST book, which
+Cloudflare caches for 30 s. Each Kalshi sample (one per second) is paired with the last Polymarket update at or
+before it (quotes stay valid between changes; `pm_age_s` says how old), so a gap is never made of a newer price
+on one side than the other. `first_trades(delay=1)` acts on a gap at second t but fills at second t+1's prices,
+and only if the gap is still there.
 
     uv run python -m pipeline.arb --backfill-results   # fetch Polymarket US settlements for recorded windows
 """
@@ -48,13 +50,13 @@ def load(db=DB, t0: int | None = None, t1: int | None = None,
         t0 = 0 if t0 is None else t0
         t1 = 2**62 if t1 is None else t1
         mk = ticks.markets(c) if mk is None else mk
-        return ticks.pmus_book(c, t0, t1), ticks.kalshi_book(c, t0, t1), \
+        return ticks.pmus_live(c, t0, t1), ticks.kalshi_book(c, t0, t1), \
             mk[["ticker", "close_ts", "target", "result", "expiration_value"]], ticks.pmus_results(c, t0, t1)
     finally:
         c.close()
 
 
-KEEP = ["ticker", "sec", "close_ts", "secs_left", "target", "expiration_value", "result", "pm_up",
+KEEP = ["ticker", "sec", "close_ts", "secs_left", "target", "expiration_value", "result", "pm_up", "pm_age_s",
         "cost_a", "cost_b", "fees_a", "fees_b", "edge_a", "edge_b", "edge", "size_a", "size_b"]
 
 
@@ -83,12 +85,18 @@ def panel(pm: pd.DataFrame, kb: pd.DataFrame, mk: pd.DataFrame, res: pd.DataFram
     mk["slug"] = mk.start.dt.strftime("cpc-btc-updown-15m-%Y-%m-%d-") + mk.start.dt.strftime("%H%M") + "z"
     res = res if res is not None and len(res) else pd.DataFrame(columns=["slug", "settle_px"])
     mk = mk.merge(res[["slug", "settle_px"]].rename(columns={"settle_px": "pm_up"}), on="slug", how="left")
-    k = kb.assign(sec=kb.ts // 1000).groupby(["ticker", "sec"]).last().reset_index()
+    k = kb.assign(sec=kb.ts // 1000).groupby(["ticker", "sec"]).last().reset_index()   # last Kalshi sample per second
     k = k.merge(mk[["ticker", "slug", "close_ts", "target", "result", "expiration_value", "pm_up"]], on="ticker")
-    p = pm.assign(sec=pm.ts // 1000).groupby(["slug", "sec"]).last().reset_index()
-    d = k.merge(p, on=["slug", "sec"], suffixes=("_k", "_p")).dropna(subset=["yes_bid", "yes_ask", "best_bid", "best_ask"])
+    p = pm.rename(columns={"ts": "pm_ts"}).sort_values("pm_ts")
+    # Polymarket's book at the moment of each Kalshi sample: its last update at or before that instant
+    d = pd.merge_asof(k.sort_values("ts"), p, left_on="ts", right_on="pm_ts", by="slug", direction="backward",
+                      tolerance=120_000)
+    d = d.dropna(subset=["yes_bid", "yes_ask", "best_bid", "best_ask"])
+    if "state" in d:
+        d = d[d.state.isna() | (d.state == "MARKET_STATE_OPEN")]
     if d.empty:
         return d
+    d["pm_age_s"] = (d.ts - d.pm_ts) / 1000
     d["secs_left"] = d.close_ts / 1000 - d.sec
     # A: Kalshi YES at ask + PM-US Down at (1 - Up bid)
     d["cost_a"] = d.yes_ask + (1 - d.best_bid)
@@ -155,6 +163,7 @@ def summary(d: pd.DataFrame) -> dict:
     return {
         "status": "ok",
         "windows": int(d.ticker.nunique()),
+        "median_polymarket_quote_age_s": float(d.pm_age_s.median()),
         "seconds": int(len(d)),
         "share_seconds_edge_gt_0": float((d.edge > 0).mean()),
         "share_windows_any_edge_gt_0": float(w.edge.max().gt(0).mean()),
@@ -183,6 +192,17 @@ def dollars(t: pd.DataFrame, bankroll: float = 100.0) -> float:
     return float((t.pnl * np.minimum(t["size"], bankroll / cost)).sum())
 
 
+def _first_polymarket_ts(c: sqlite3.Connection) -> int | None:
+    """Earliest recorded Polymarket update, from either book table (settlement results exist for both)."""
+    firsts = []
+    for table in ("pmus_ws", "pmus_book"):
+        if c.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone():
+            t = c.execute(f"SELECT min(ts) FROM {table}").fetchone()[0]
+            if t is not None:
+                firsts.append(t)
+    return min(firsts) if firsts else None
+
+
 def backfill_results(db=DB) -> int:
     """Fetch Polymarket US settlements for every recorded window that has Polymarket books."""
     import time
@@ -194,7 +214,7 @@ def backfill_results(db=DB) -> int:
     c = sqlite3.connect(db, timeout=120)
     c.execute("CREATE TABLE IF NOT EXISTS pmus_results (slug TEXT PRIMARY KEY, close_ts INTEGER, state TEXT, "
               "settle_px REAL)")
-    first = c.execute("SELECT min(ts) FROM pmus_book").fetchone()[0]
+    first = _first_polymarket_ts(c)
     if first is None:
         return 0
     todo = [r[0] for r in c.execute(
