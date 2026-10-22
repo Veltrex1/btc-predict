@@ -242,6 +242,13 @@ class PMBookFeed:
                 log.info("Polymarket US WebSocket request style: %s", self.fmt)
 
     def _on_error(self, request_id: str | None, text: str) -> None:
+        if "already subscribed" in text.lower():
+            # Not a failure: the server has the subscription (a window listed ahead of its opening is quiet until it
+            # opens). It also proves the request style was understood, so stop re-sending and keep the style.
+            slug = self._pending.get(request_id or "", (None,))[0]
+            if slug:
+                self._confirm(slug)
+            return
         self.errors.append(text)
         if len(self.errors) <= 3 or len(self.errors) % 60 == 0:  # an unlisted window errors every few seconds
             log.warning("Polymarket US WebSocket error for %s: %s (%d so far)", request_id, text[:200], len(self.errors))

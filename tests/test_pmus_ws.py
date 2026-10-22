@@ -196,3 +196,24 @@ def test_loop_arb_row_waits_for_real_time_data_instead_of_scoring_stale_prices(t
     monkeypatch.setattr(arb, "panel_all_days", lambda *a, **k: pd.DataFrame())
     (row,) = loop.cand_arb()
     assert "waiting for real-time Polymarket data" in row["candidate"] and row["windows"] == 0 and not row["promote"]
+
+
+def test_already_subscribed_reply_is_a_confirmation_not_an_error():
+    feed = pw.PMBookFeed("k", None)
+    feed._pending["book-x"] = ("cpc-next", "camel", 0.0)
+    feed._on_error("book-x", "slug already subscribed: cpc-next")
+    assert "cpc-next" in feed._seen and feed.fmt == "camel" and feed.errors == []
+    assert feed._try[0] == "camel"          # no style flip
+
+
+def test_a_style_that_is_rejected_is_flipped_exactly_once():
+    feed = pw.PMBookFeed("k", None)
+    for rid in ("book-a", "trade-a"):       # both subscriptions of a tick are rejected
+        feed._sent_fmt[rid] = "camel"
+        feed._on_error(rid, "unknown field")
+    assert feed._try[0] == "snake" and len(feed.errors) == 2
+
+
+def test_retention_for_the_busy_real_time_tables_is_two_weeks():
+    from recorder import compact
+    assert compact.KEEP["pmus_ws"][0] == compact.KEEP["pmus_trades"][0] == 14 * compact.DAY_MS

@@ -6,7 +6,7 @@
   venue per second, which is all the studies use) and deleted.
 - High-volume raw feeds are trimmed: BRTI 5 Hz and Kalshi order-book deltas after
   3 days, Deribit ticks after 7 days, Kalshi public trades after 14 days, Polymarket US real-time books and
-  trades after 30 days.
+  trades after 14 days (busy windows change the top of book ~10 times a second).
 - Kept permanently: Kalshi 1 s books, BRTI 1 Hz (incl. the forming settlement
   average), Polymarket US books, market results, spot_1s.
 
@@ -29,8 +29,8 @@ KEEP = {  # table: (age limit ms, time column, extra filter)
     "kalshi_ob": (3 * DAY_MS, "ts", None),
     "deribit": (7 * DAY_MS, "ts", None),
     "kalshi_trades": (14 * DAY_MS, "ts", None),
-    "pmus_ws": (30 * DAY_MS, "ts", None),
-    "pmus_trades": (30 * DAY_MS, "ts", None),
+    "pmus_ws": (14 * DAY_MS, "ts", None),
+    "pmus_trades": (14 * DAY_MS, "ts", None),
 }
 
 
