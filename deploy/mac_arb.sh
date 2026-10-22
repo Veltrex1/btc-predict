@@ -6,6 +6,8 @@
 #   bash deploy/mac_arb.sh check     read-only: balances, both books, Polymarket order validation
 #   bash deploy/mac_arb.sh shadow    run without sending orders
 #   bash deploy/mac_arb.sh live      real orders (asks you to type LIVE)
+#   bash deploy/mac_arb.sh probe     ONE real 1-contract Polymarket buy + sell-back (about 5 cents) to see its replies
+#   bash deploy/mac_arb.sh resume    clear a halt (after you checked both apps) and start again in the saved mode
 #   bash deploy/mac_arb.sh status    recent attempts and P&L
 #   bash deploy/mac_arb.sh off       stop trading
 # It runs as a background service (launchd) wrapped in `caffeinate`, so it keeps going when Terminal is closed
@@ -112,6 +114,15 @@ case $cmd in
     [ "$ans" = "LIVE" ] || { echo "Not started."; exit 1; }
     setenv ARB_MODE live; clear_halt; install_agent
     echo "LIVE. Keep this Mac plugged in and online. Watch: tail -f $LOG    Stop: bash deploy/mac_arb.sh off" ;;
+  probe)
+    need_setup
+    agent_running && { echo "Stop the trader first: bash deploy/mac_arb.sh off"; exit 1; }
+    read -r -p "This places a REAL 1-contract order on Polymarket US (buy, then sell back; costs about 5 cents). Type PROBE: " ans
+    [ "$ans" = "PROBE" ] || { echo "Not run."; exit 1; }
+    run_py -m server.arb_trader --probe-order ;;
+  resume)
+    need_setup; clear_halt; install_agent
+    echo "Resumed in $(grep '^ARB_MODE=' "$ENVF" | cut -d= -f2) mode." ;;
   status)
     need_setup
     if agent_running; then echo "trader service: running"; else echo "trader service: NOT running"; fi

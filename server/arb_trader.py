@@ -47,7 +47,7 @@ from pipeline.strategy import fee as kalshi_fee
 from recorder.run import parse_pmus, pmus_settle, pmus_slug
 
 from .kalshi_client import Book, KalshiClient, public_book
-from .polymarket_us_client import PolymarketUSClient
+from .polymarket_us_client import FillUnknown, PolymarketUSClient
 from .polymarket_us_client import GATEWAY as PM_GATEWAY
 from .polymarket_us_client import public_book as pm_public_book
 
@@ -316,14 +316,20 @@ class ArbTrader:
         short = o["side"] == "A"
         try:
             f = self.pm.place(row["slug"], o["pm_intent"], o["pm_yes"], o["qty"])
-        except Exception as e:  # noqa: BLE001
-            row.update(pm_filled=0.0, k_filled=0.0, note=f"polymarket order failed: {e}"[:300])
+        except (FillUnknown, requests.RequestException) as e:
+            # accepted or possibly accepted, outcome unknown (timeout, no confirmation): do not guess, stop and look
+            row.update(pm_filled=0.0, k_filled=0.0, note=f"UNCONFIRMED polymarket order: {e}"[:400])
+            self.halt("a Polymarket order could not be confirmed: check the Polymarket app for positions, "
+                      "then run: bash deploy/mac_arb.sh resume")
+            return
+        except Exception as e:  # noqa: BLE001  (an HTTP error reply: the order was refused, nothing filled)
+            row.update(pm_filled=0.0, k_filled=0.0, note=f"polymarket order refused: {e}"[:300])
             return
         pm_q = f["filled"]
         own = None if f["avg_yes_price"] is None else (round(1 - f["avg_yes_price"], 6) if short else f["avg_yes_price"])
         row.update(pm_filled=pm_q, pm_avg=own if pm_q else None,
                    pm_fee=f["fee"] if f["fee"] is not None else (pmus_fee(pm_q, own) if pm_q else 0.0),
-                   note=f"pm order {f['order_id']}")
+                   note=f"pm order {f['order_id']}" + ("" if pm_q else f"; no fill; reply {json.dumps(f['raw']['create'])[:350]}"))
         if pm_q <= 0:
             row.update(k_filled=0.0)
             return
@@ -528,6 +534,41 @@ def _merge(a: dict | None, b: dict | None) -> dict | None:
             "avg_quoted_edge": sum(e * w for e, w in edges) / sum(w for _, w in edges) if edges and n else None}
 
 
+def probe_order(pm: PolymarketUSClient | None) -> None:
+    """Buy ONE Up contract at the current ask, show everything Polymarket answers, then sell it back.
+    Costs about 5 cents (spread plus fees) and shows whether the displayed book is really executable."""
+    if pm is None:
+        print("Polymarket credentials missing")
+        return
+    http = requests.Session()
+    m = current_market(http)
+    secs = (m["close_ts"] - time.time() * 1000) / 1000 if m else 0
+    if not m or secs < 120:
+        print("need an open window with at least 2 minutes left; run again in a moment")
+        return
+    pb = pm_book_from(pm_public_book(m["slug"]))
+    if not pb or pb.best_ask is None or pb.best_bid is None:
+        print("no Polymarket book right now; try again")
+        return
+    print(f"window {m['slug']}, book bid {pb.best_bid} / ask {pb.best_ask}; cash before {pm.balance()['cash']:.2f}")
+    try:
+        f = pm.place(m["slug"], "ORDER_INTENT_BUY_LONG", pb.best_ask, 1)
+    except FillUnknown as e:
+        print("RESULT UNCONFIRMED:", e)
+        print("Check the Polymarket app for a BTC position and close it by hand if one exists.")
+        return
+    print("buy reply:", json.dumps(f["raw"], indent=1)[:3000])
+    print(f"=> filled {f['filled']} at {f['avg_yes_price']}, fee {f['fee']}")
+    if f["filled"]:
+        bid = (pm_book_from(pm_public_book(m["slug"])) or pb).best_bid or pb.best_bid
+        sold = pm.place(m["slug"], "ORDER_INTENT_SELL_LONG", max(0.01, bid - 0.02), f["filled"])
+        print("sell reply:", json.dumps(sold["raw"], indent=1)[:3000])
+        print(f"=> sold {sold['filled']} at {sold['avg_yes_price']}, fee {sold['fee']}")
+        if sold["filled"] < f["filled"]:
+            print("The sell did not fill completely: close the leftover contract in the Polymarket app.")
+    print(f"cash after {pm.balance()['cash']:.2f}")
+
+
 def summary(db_path: Path = DB) -> dict | None:
     """For the dashboard: attempts, fill rates and realised P&L. `live` combines this machine and any machine
     reporting in (the Mac); `running` lists the reporting machines with how long ago they were last seen."""
@@ -562,6 +603,8 @@ def main() -> None:
     ap.add_argument("--check", action="store_true", help="read-only: balances, both books, current opportunity")
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--summary", action="store_true", help="attempts and P&L so far")
+    ap.add_argument("--probe-order", action="store_true",
+                    help="REAL 1-contract Polymarket round trip (buy at the ask, sell back) to see the exchange's replies")
     ap.add_argument("--clear-halt", action="store_true", help="resume after a halt (stop file, daily stop, unhedged)")
     args = ap.parse_args()
     if args.summary:
@@ -582,6 +625,9 @@ def main() -> None:
     pm = PolymarketUSClient.from_env() if have_pm else None
     if args.check:
         check(cfg, kalshi, pm)
+        return
+    if args.probe_order:
+        probe_order(pm)
         return
     if args.run:
         if cfg.mode not in ("shadow", "live"):

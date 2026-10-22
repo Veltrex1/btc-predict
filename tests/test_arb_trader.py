@@ -179,3 +179,91 @@ def test_check_reports_missing_book(monkeypatch, capsys):
     at.check(at.Config(), FakeKalshi([]), FakePM(0), pm_get=lambda slug: Resp(404, {"message": "not found"}))
     out = capsys.readouterr().out
     assert "HTTP 404" in out and "no book for this window" in out
+
+
+# ── Polymarket order replies ──────────────────────────────────────────
+from server import polymarket_us_client as pmc  # noqa: E402
+
+
+def px(v):
+    return {"value": str(v), "currency": "USD"}
+
+
+def client(monkeypatch, replies):
+    """A PolymarketUSClient whose HTTP layer answers from `replies` {(method, path-prefix): reply or exception}."""
+    c = pmc.PolymarketUSClient.__new__(pmc.PolymarketUSClient)
+    calls = []
+
+    def _req(method, path, params=None, body=None, retries=3):
+        calls.append((method, path))
+        for (m, prefix), reply in replies.items():
+            if m == method and path.startswith(prefix):
+                if isinstance(reply, Exception):
+                    raise reply
+                return reply
+        raise AssertionError(f"unexpected {method} {path}")
+    c._req = _req
+    monkeypatch.setattr(pmc.time, "sleep", lambda s: None)
+    return c, calls
+
+
+def test_fill_read_from_create_reply_without_looking_the_order_up(monkeypatch):
+    create = {"id": "O1", "executions": [
+        {"type": "EXECUTION_TYPE_PARTIAL_FILL", "lastShares": "4", "lastPx": px(0.60),
+         "order": {"commissionNotionalTotalCollected": px(0.10)}},
+        {"type": "EXECUTION_TYPE_FILL", "lastShares": "6", "lastPx": px(0.61),
+         "order": {"commissionNotionalTotalCollected": px(0.26)}}]}
+    c, calls = client(monkeypatch, {("POST", "/v1/orders"): create})
+    r = c.place("slug", "ORDER_INTENT_BUY_LONG", 0.61, 10)
+    assert r["filled"] == 10 and abs(r["avg_yes_price"] - 0.606) < 1e-9 and r["fee"] == 0.26
+    assert calls == [("POST", "/v1/orders")]
+
+
+def test_unfilled_ioc_is_zero_even_when_the_order_lookup_would_404(monkeypatch):
+    create = {"id": "O2", "executions": [{"type": "EXECUTION_TYPE_EXPIRED", "lastShares": "0"}]}
+    c, calls = client(monkeypatch, {("POST", "/v1/orders"): create,
+                                    ("GET", "/v1/order/"): RuntimeError("GET /v1/order/O2 -> 404: Order not found")})
+    r = c.place("slug", "ORDER_INTENT_BUY_LONG", 0.61, 10)
+    assert r["filled"] == 0 and calls == [("POST", "/v1/orders")]
+
+
+def test_lookup_used_when_reply_has_no_executions_and_404_is_retried(monkeypatch):
+    seq = iter([RuntimeError("GET /v1/order/O3 -> 404: Order not found"),
+                {"order": {"state": "ORDER_STATE_FILLED", "cumQuantity": 10, "avgPx": px(0.6),
+                           "commissionNotionalTotalCollected": px(0.2)}}])
+
+    def lookup(*a, **k):
+        v = next(seq)
+        if isinstance(v, Exception):
+            raise v
+        return v
+    c, _ = client(monkeypatch, {("POST", "/v1/orders"): {"id": "O3"}})
+    c.get = lookup
+    r = c.place("slug", "ORDER_INTENT_BUY_LONG", 0.6, 10)
+    assert r["filled"] == 10 and r["fee"] == 0.2
+
+
+def test_unconfirmed_outcome_raises_instead_of_guessing_zero(monkeypatch):
+    c, _ = client(monkeypatch, {("POST", "/v1/orders"): {"id": "O4"}})
+    c.get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("GET /v1/order/O4 -> 404: Order not found"))
+    with pytest.raises(pmc.FillUnknown):
+        c.place("slug", "ORDER_INTENT_BUY_LONG", 0.6, 10)
+
+
+def test_trader_halts_when_a_polymarket_order_cannot_be_confirmed(trader):
+    class Unsure(FakePM):
+        def place(self, slug, intent, yes_price, qty, preview=False):
+            raise pmc.FillUnknown("O5", {"id": "O5"})
+    t = trader(kalshi=FakeKalshi([10]), pm=Unsure(fill=10))
+    r = t.step()
+    assert r["note"].startswith("UNCONFIRMED") and t.halted.startswith("a Polymarket order could not be confirmed")
+    assert t.step() is None
+
+
+def test_trader_treats_an_http_refusal_as_nothing_filled_and_keeps_going(trader):
+    class Refuses(FakePM):
+        def place(self, slug, intent, yes_price, qty, preview=False):
+            raise RuntimeError("POST /v1/orders -> 400: bad price")
+    t = trader(kalshi=FakeKalshi([10]), pm=Refuses(fill=10))
+    r = t.step()
+    assert r["status"] == "missed" and "refused" in r["note"] and t.halted is None

@@ -89,7 +89,12 @@ class PolymarketUSClient:
 
     def place(self, slug: str, intent: str, yes_price: float, qty: float, preview: bool = False) -> dict:
         """Immediate-or-cancel limit order. Prices always refer to the YES (Up) side, so buying Down at q
-        is intent ORDER_INTENT_BUY_SHORT at yes_price 1 - q. Returns {order_id, filled, avg_yes_price, fee, raw}."""
+        is intent ORDER_INTENT_BUY_SHORT at yes_price 1 - q.
+
+        Returns {order_id, filled, avg_yes_price, fee, raw}. What filled is read from the create reply's
+        executions first (an order that expires unfilled is not always retrievable afterwards: GET /v1/order/{id}
+        can answer 404). Only if that reply does not settle the matter is the order looked up, and if its fate
+        still cannot be confirmed this raises FillUnknown instead of guessing."""
         body = {"marketSlug": slug, "intent": intent, "type": "ORDER_TYPE_LIMIT",
                 "price": {"value": f"{yes_price:.2f}", "currency": "USD"}, "quantity": qty,
                 "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
@@ -98,23 +103,66 @@ class PolymarketUSClient:
             return self._req("POST", "/v1/order/preview", body={"request": body})
         r = self._req("POST", "/v1/orders", body={**body, "synchronousExecution": True, "maxBlockTime": "3"})
         oid = r.get("id", "")
-        o = self.order(oid) if oid else {}
-        return {"order_id": oid, **fill_summary(o, r.get("executions") or []), "raw": {"create": r, "order": o}}
+        execs = r.get("executions") or []
+        order = {}
+        if not _is_final(execs):
+            order = self._settled_order(oid)
+            if not order or order.get("state") not in FINAL_STATES:
+                got = fill_summary(order, execs)
+                if not (got["filled"] and order.get("state") in (None, "ORDER_STATE_PARTIALLY_FILLED")):
+                    raise FillUnknown(oid, r)
+        return {"order_id": oid, **fill_summary(order, execs), "raw": {"create": r, "order": order}}
+
+    def _settled_order(self, order_id: str, tries: int = 6, delay: float = 0.5) -> dict:
+        """Poll the order until it reaches a final state; tolerates 404 (not visible yet / already gone)."""
+        order: dict = {}
+        for _ in range(tries):
+            try:
+                order = self.order(order_id)
+            except RuntimeError as e:
+                if " 404" not in str(e):
+                    raise
+            if order.get("state") in FINAL_STATES:
+                break
+            time.sleep(delay)
+        return order
 
     def order(self, order_id: str) -> dict:
         return self.get(f"/v1/order/{order_id}").get("order", {})
 
 
+class FillUnknown(RuntimeError):
+    """An order was accepted but whether it filled could not be confirmed: stop trading and look at the account."""
+
+    def __init__(self, order_id: str, reply: dict):
+        super().__init__(f"could not confirm the outcome of Polymarket order {order_id}: {str(reply)[:300]}")
+        self.order_id = order_id
+
+
+FINAL_STATES = ("ORDER_STATE_FILLED", "ORDER_STATE_CANCELED", "ORDER_STATE_EXPIRED", "ORDER_STATE_REJECTED")
+FINAL_EXECUTIONS = ("EXECUTION_TYPE_FILL", "EXECUTION_TYPE_CANCELED", "EXECUTION_TYPE_EXPIRED",
+                    "EXECUTION_TYPE_REJECTED", "EXECUTION_TYPE_DONE_FOR_DAY")
+
+
+def _is_final(executions: list[dict]) -> bool:
+    """True when the executions in the create reply already end the order (filled, expired, canceled, rejected)."""
+    return any(e.get("type") in FINAL_EXECUTIONS for e in executions)
+
+
 def fill_summary(order: dict, executions: list[dict]) -> dict:
-    """Filled quantity, average YES price and commission from an order (falling back to its executions)."""
+    """Filled quantity, average YES price and commission, from the order if it reports them, else from executions."""
     filled = float(order.get("cumQuantity") or 0)
     avg = (order.get("avgPx") or {}).get("value") if isinstance(order.get("avgPx"), dict) else order.get("avgPx")
+    fee = order.get("commissionNotionalTotalCollected")
     if not filled and executions:
         fills = [(float(e.get("lastShares") or 0), float((e.get("lastPx") or {}).get("value") or 0))
                  for e in executions if e.get("type") in ("EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL")]
         filled = sum(q for q, _ in fills)
         avg = sum(q * p for q, p in fills) / filled if filled else None
-    fee = order.get("commissionNotionalTotalCollected")
+        for e in reversed(executions):  # the last execution carries the running commission total
+            fee = (e.get("order") or {}).get("commissionNotionalTotalCollected") or fee
+            if fee:
+                break
     fee = fee.get("value") if isinstance(fee, dict) else fee
     return {"filled": filled, "avg_yes_price": float(avg) if avg not in (None, "") else None,
             "fee": float(fee) if fee not in (None, "") else None}
