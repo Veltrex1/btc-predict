@@ -35,13 +35,15 @@ interface Research {
   loop: { ts: string; results: LoopRow[] } | null;
   recorder: Record<string, number | string | null>;
   bot: { mode: string; equity: number; pnl: number; trade_count: number; halted: string | null; allocation: number } | null;
-  arb?: ({ mode: string; halted: string | null } & Partial<Record<'shadow' | 'live', ArbStats>>) | null;
+  arb?: ({ mode: string; halted: string | null; running?: Runner[] } & Partial<Record<'shadow' | 'live', ArbStats>>) | null;
 }
 
 interface Balances {
   kalshi?: number; polymarket?: number; total?: number; kalshi_error?: string; polymarket_error?: string;
-  arb: { mode: string; halted: string | null; pnl: number; pnl_today: number; pairs: number; real: boolean };
+  arb: { mode: string; halted: string | null; pnl: number; pnl_today: number; pairs: number; real: boolean; running?: Runner[] };
 }
+
+interface Runner { source: string; mode: string; halted: string | null; age_s: number }
 
 interface ArbStats { attempts: number; hedged: number; unwound: number; avg_quoted_edge: number | null; pnl: number; settled: number; contracts: number }
 
@@ -202,15 +204,16 @@ function PortfolioPanel({ pf }: { pf: Portfolio }) {
 
 function arbValue(a: Research['arb']): string {
   if (!a) return 'off';
-  const s = a[a.mode === 'live' ? 'live' : 'shadow'];
-  if (a.halted) return `halted`;
-  return s ? `${a.mode} ${s.pnl >= 0 ? '+' : ''}${usd(s.pnl)}` : a.mode;
+  const live = a.live ? 'live' : null;
+  const s = a.live ?? a.shadow;
+  if (a.halted) return 'halted';
+  return s ? `${live ?? 'shadow'} ${s.pnl >= 0 ? '+' : ''}${usd(s.pnl)}` : a.mode;
 }
 
 function arbSub(a: Research['arb']): string | undefined {
   if (!a) return undefined;
   if (a.halted) return a.halted;
-  const s = a[a.mode === 'live' ? 'live' : 'shadow'];
+  const s = a.live ?? a.shadow;
   return s ? `${s.hedged}/${s.attempts} pairs hedged, ${s.settled} settled` : 'no attempts yet';
 }
 
@@ -265,16 +268,21 @@ function signed(n: number) { return `${n >= 0 ? '+' : '−'}${usd(Math.abs(n))}`
 function AccountBar({ b }: { b: Balances }) {
   const a = b.arb;
   const pnlColor = (n: number) => ({ color: n > 0 ? 'var(--above)' : n < 0 ? 'var(--below)' : 'var(--ink)' });
-  const what = a.real ? 'real money' : a.mode === 'shadow' ? 'shadow, no real orders' : a.mode;
+  const r = a.running?.find(x => x.mode === 'live') ?? a.running?.[0];
+  const stale = r?.mode === 'live' && r.age_s > 120;   // the trading Mac is asleep or offline
+  const what = r ? `${r.source} ${r.mode}${r.mode === 'live' ? `, seen ${Math.round(r.age_s)}s ago` : ', no real orders'}`
+    : a.real ? 'real money' : a.mode === 'shadow' ? 'shadow, no real orders' : a.mode;
   return (
     <Panel grid="grid grid-cols-2 gap-4 md:grid-cols-5">
-      <Stat label="Kalshi" value={b.kalshi_error ? 'error' : usd(b.kalshi)} sub={b.kalshi_error} />
-      <Stat label="Polymarket US" value={b.polymarket_error ? 'error' : usd(b.polymarket)} sub={b.polymarket_error} />
+      <Stat label="Kalshi" value={b.kalshi != null ? usd(b.kalshi) : b.kalshi_error ? 'error' : '–'} sub={b.kalshi == null ? b.kalshi_error : undefined} />
+      <Stat label="Polymarket US" value={b.polymarket != null ? usd(b.polymarket) : b.polymarket_error ? 'error' : '–'} sub={b.polymarket == null ? b.polymarket_error : undefined} />
       <Stat label="Total" value={usd(b.total)} />
       <div>
         <div className="text-xs text-[var(--ink-3)]">P&amp;L today</div>
         <div className="num font-mono text-lg" style={pnlColor(a.pnl_today)}>{signed(a.pnl_today)}</div>
-        <div className="num text-xs text-[var(--ink-2)]">{a.halted ? `halted: ${a.halted}` : what}</div>
+        <div className="num text-xs" style={{ color: stale ? 'var(--below)' : 'var(--ink-2)' }}>
+          {a.halted ? `halted: ${a.halted}` : stale ? `${what} (trader offline?)` : what}
+        </div>
       </div>
       <div>
         <div className="text-xs text-[var(--ink-3)]">P&amp;L all time</div>

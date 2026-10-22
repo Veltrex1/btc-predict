@@ -489,11 +489,11 @@ def get_portfolio() -> dict:
     return TRADER.status()
 
 
-_BAL: dict = {"ts": 0.0, "data": None}
+_BAL: dict = {"ts": 0.0, "data": {}}
 
 
 def _balances() -> dict:
-    """Both venues' account balances (Kalshi cash + open positions, Polymarket US cash), cached 15 s."""
+    """Both venues' account balances (Kalshi cash + open positions, Polymarket US cash)."""
     out: dict = {}
     if os.environ.get("KALSHI_KEY_ID") and os.environ.get("KALSHI_PRIVATE_KEY_PATH"):
         try:
@@ -512,9 +512,15 @@ def _balances() -> dict:
 
 @app.get("/balances")
 def get_balances() -> dict:
-    """Top-of-page account summary: both balances, their total, and the arbitrage trader's realised P&L."""
+    """Top-of-page account summary: both balances, their total, and the arbitrage trader's realised P&L
+    (this server plus any machine reporting in). Cached 15 s; a rate-limited refresh keeps the last good value."""
     if time.time() - _BAL["ts"] > 15:
-        _BAL["data"], _BAL["ts"] = _balances(), time.time()
+        new, prev = _balances(), _BAL["data"]
+        for k in ("kalshi", "polymarket"):
+            if k not in new and k in prev:  # e.g. Kalshi 429 "too many requests": show the last good balance
+                new[k] = prev[k]
+                new.pop(f"{k}_error", None)
+        _BAL["data"], _BAL["ts"] = new, time.time()
     out = dict(_BAL["data"])
     if "kalshi" in out or "polymarket" in out:
         out["total"] = out.get("kalshi", 0.0) + out.get("polymarket", 0.0)
@@ -523,12 +529,23 @@ def get_balances() -> dict:
         a = arb_summary() or {}
     except sqlite3.Error:
         a = {}
-    mode = a.get("mode", "off")
-    stats = a.get("live") if mode == "live" or a.get("live") else a.get("shadow")
-    out["arb"] = {"mode": mode, "halted": a.get("halted"), "pnl": (stats or {}).get("pnl", 0.0),
-                  "pnl_today": (stats or {}).get("pnl_today", 0.0), "pairs": (stats or {}).get("settled", 0),
-                  "real": bool(a.get("live"))}
+    live = a.get("live")
+    stats = live or a.get("shadow") or {}
+    running = a.get("running", [])
+    out["arb"] = {"mode": a.get("mode", "off"), "pnl": stats.get("pnl", 0.0), "pnl_today": stats.get("pnl_today", 0.0),
+                  "pairs": stats.get("settled", 0), "real": bool(live), "running": running,
+                  "halted": a.get("halted") or next((r["halted"] for r in running if r.get("halted")), None)}
     return out
+
+
+@app.post("/arb/report")
+def post_arb_report(body: dict):
+    """The Mac trader sends its attempts and a heartbeat here (token required like every endpoint)."""
+    from .arb_trader import store_report
+    try:
+        return {"stored": store_report(body)}
+    except (ValueError, KeyError, TypeError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 @app.post("/trading/stop")

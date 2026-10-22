@@ -21,6 +21,10 @@ ARB_PAIRS_PER_WINDOW (1), ARB_DAILY_STOP (5), ARB_FLOOR (2). data/STOP halts it.
 
     uv run python -m server.arb_trader --check     # read-only: balances, books, current opportunity
     uv run python -m server.arb_trader --run       # the service loop (mode from ARB_MODE)
+
+Polymarket US only accepts orders from a connection it can place in an allowed state, so the live trader runs
+on the owner's Mac (deploy/mac_arb.sh). With ARB_REPORT_URL (+ BTC_API_TOKEN) set it also sends its attempts and a
+heartbeat to the dashboard server every 30 s (POST /arb/report), so balances and P&L still show in one place.
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -57,10 +62,21 @@ CREATE TABLE IF NOT EXISTS attempts (
     secs_left REAL, quoted_edge REAL, k_side TEXT, k_price REAL, pm_intent TEXT, pm_price REAL, size_seen REAL,
     qty REAL, pm_filled REAL, pm_avg REAL, pm_fee REAL, k_filled REAL, k_avg REAL, k_fee REAL,
     unwind_filled REAL DEFAULT 0, unwind_avg REAL, unwind_fee REAL DEFAULT 0,
-    status TEXT, note TEXT, k_result TEXT, pm_up REAL, payout REAL, pnl REAL, settled_ts TEXT
+    status TEXT, note TEXT, k_result TEXT, pm_up REAL, payout REAL, pnl REAL, settled_ts TEXT,
+    synced INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS arb_state (k TEXT PRIMARY KEY, v TEXT);
 """
+
+# on the dashboard server: what other machines (the Mac) report
+REMOTE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS remote_attempts (
+    source TEXT, id INTEGER, mode TEXT, status TEXT, quoted_edge REAL, k_filled REAL, pnl REAL, settled_ts TEXT,
+    row TEXT, PRIMARY KEY (source, id)
+);
+CREATE TABLE IF NOT EXISTS remote_state (source TEXT PRIMARY KEY, mode TEXT, halted TEXT, last_seen REAL);
+"""
+REPORT_EVERY_S = 30
 
 
 @dataclass
@@ -156,15 +172,21 @@ class ArbTrader:
         if cfg.mode == "live" and (kalshi is None or pm is None):
             raise RuntimeError("live mode needs both Kalshi and Polymarket US credentials")
         self.cfg, self.kalshi, self.pm = cfg, kalshi, pm
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(db_path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        if "synced" not in [r[1] for r in self.db.execute("PRAGMA table_info(attempts)")]:  # database from before reporting
+            self.db.execute("ALTER TABLE attempts ADD COLUMN synced INTEGER DEFAULT 0")
+            self.db.commit()
         self.http = requests.Session()
         self.market: dict | None = None
         self.balances: dict = {}
         self._last_bal = 0.0
         self._last_settle = 0.0
         self._last_market = 0.0
+        self._last_report = 0.0
+        self.source = os.environ.get("ARB_SOURCE", "local")
 
     # ── state ────────────────────────────────────────────────────────
     @property
@@ -363,14 +385,33 @@ class ArbTrader:
                     pass
             res = pair_pnl(row)
             payout, pnl = res if res else (None, None)
-            self.db.execute("UPDATE attempts SET k_result = ?, pm_up = ?, pnl = ?, payout = ?, settled_ts = ? "
-                            "WHERE id = ?", (row["k_result"], row["pm_up"], pnl, payout,
+            self.db.execute("UPDATE attempts SET k_result = ?, pm_up = ?, pnl = ?, payout = ?, settled_ts = ?, "
+                            "synced = 0 WHERE id = ?", (row["k_result"], row["pm_up"], pnl, payout,
                                              datetime.now(UTC).isoformat(timespec="seconds") if res else None,
                                              row["id"]))
             if res and row["k_result"] and row["pm_up"] is not None and (row["k_result"] == "yes") != (row["pm_up"] > 0.5):
                 log.warning("venues settled differently on %s", row["slug"])
         if rows:
             self.db.commit()
+
+    # ── dashboard report ─────────────────────────────────────────────
+    def push_report(self) -> int:
+        """Send unsynced attempts and a heartbeat to the dashboard server (no-op without ARB_REPORT_URL)."""
+        url = os.environ.get("ARB_REPORT_URL")
+        if not url:
+            return 0
+        rows = [{k: v for k, v in dict(r).items() if k != "synced"}
+                for r in self.db.execute("SELECT * FROM attempts WHERE synced = 0 ORDER BY id LIMIT 500")]
+        token = os.environ.get("BTC_API_TOKEN")
+        r = self.http.post(url, json={"source": self.source, "mode": self.cfg.mode, "halted": self.halted,
+                                      "rows": rows},
+                           headers={"Authorization": f"Bearer {token}"} if token else {}, timeout=10)
+        r.raise_for_status()
+        if rows:
+            self.db.execute(f"UPDATE attempts SET synced = 1 WHERE id IN ({','.join('?' * len(rows))})",
+                            [x["id"] for x in rows])
+            self.db.commit()
+        return len(rows)
 
     def run(self) -> None:
         log.info("arbitrage trader starting in %s mode: %s", self.cfg.mode, self.cfg)
@@ -381,7 +422,40 @@ class ArbTrader:
             except Exception:  # noqa: BLE001
                 log.exception("arb step failed")
                 time.sleep(2)
+            if time.time() - self._last_report >= REPORT_EVERY_S:
+                self._last_report = time.time()
+                try:
+                    self.push_report()
+                except Exception as e:  # noqa: BLE001  (the dashboard being unreachable must never affect trading)
+                    log.warning("could not report to the dashboard: %s", e)
             time.sleep(max(0.0, 0.5 - (time.time() - t0)))
+
+
+def store_report(body: dict, db_path: Path = DB) -> int:
+    """Dashboard server side of push_report: upsert another machine's attempts and record its heartbeat."""
+    source = str(body.get("source") or "")
+    mode = str(body.get("mode") or "")
+    rows = body.get("rows") or []
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", source):
+        raise ValueError("bad source")
+    if mode not in ("off", "shadow", "live"):
+        raise ValueError("bad mode")
+    if not isinstance(rows, list) or len(rows) > 1000:
+        raise ValueError("rows must be a list of at most 1000")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(db_path, timeout=10)
+    try:
+        c.executescript(SCHEMA + REMOTE_SCHEMA)
+        for r in rows:
+            c.execute("INSERT OR REPLACE INTO remote_attempts VALUES (?,?,?,?,?,?,?,?,?)",
+                      (source, int(r["id"]), str(r.get("mode")), r.get("status"), r.get("quoted_edge"),
+                       r.get("k_filled"), r.get("pnl"), r.get("settled_ts"), json.dumps(r)))
+        c.execute("INSERT OR REPLACE INTO remote_state VALUES (?,?,?,?)",
+                  (source, mode, body.get("halted"), time.time()))
+        c.commit()
+    finally:
+        c.close()
+    return len(rows)
 
 
 def check(cfg: Config, kalshi: KalshiClient | None, pm: PolymarketUSClient | None,
@@ -430,8 +504,33 @@ def check(cfg: Config, kalshi: KalshiClient | None, pm: PolymarketUSClient | Non
             print(f"preview {intent} @ Up {yes_px:.2f}: REJECTED {e}")
 
 
+STATS_SQL = ("SELECT mode, count(*), sum(status = 'hedged'), sum(status = 'unwound'), avg(quoted_edge), "
+             "sum(pnl), count(pnl), sum(k_filled), sum(CASE WHEN substr(settled_ts, 1, 10) = ? THEN pnl END) "
+             "FROM {} GROUP BY mode")
+
+
+def _group_stats(c: sqlite3.Connection, table: str, today: str) -> dict:
+    out = {}
+    for (mode, n, hedged, unwound, edge, pnl, settled, contracts, pnl_today) in c.execute(
+            STATS_SQL.format(table), (today,)):
+        out[mode] = {"attempts": n, "hedged": hedged or 0, "unwound": unwound or 0, "avg_quoted_edge": edge,
+                     "pnl": pnl or 0.0, "pnl_today": pnl_today or 0.0, "settled": settled,
+                     "contracts": contracts or 0}
+    return out
+
+
+def _merge(a: dict | None, b: dict | None) -> dict | None:
+    if not a or not b:
+        return a or b
+    n = a["attempts"] + b["attempts"]
+    edges = [(x["avg_quoted_edge"], x["attempts"]) for x in (a, b) if x["avg_quoted_edge"] is not None]
+    return {**{k: a[k] + b[k] for k in ("attempts", "hedged", "unwound", "pnl", "pnl_today", "settled", "contracts")},
+            "avg_quoted_edge": sum(e * w for e, w in edges) / sum(w for _, w in edges) if edges and n else None}
+
+
 def summary(db_path: Path = DB) -> dict | None:
-    """For the dashboard: attempts, fill rates and realised P&L per mode."""
+    """For the dashboard: attempts, fill rates and realised P&L. `live` combines this machine and any machine
+    reporting in (the Mac); `running` lists the reporting machines with how long ago they were last seen."""
     if not db_path.exists():
         return None
     c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
@@ -439,13 +538,18 @@ def summary(db_path: Path = DB) -> dict | None:
         out = {"mode": os.environ.get("ARB_MODE", "off"),
                "halted": (c.execute("SELECT v FROM arb_state WHERE k = 'halted'").fetchone() or [None])[0]}
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        for (mode, n, hedged, unwound, edge, pnl, settled, contracts, pnl_today) in c.execute(
-                "SELECT mode, count(*), sum(status = 'hedged'), sum(status = 'unwound'), avg(quoted_edge), "
-                "sum(pnl), count(pnl), sum(k_filled), sum(CASE WHEN substr(settled_ts, 1, 10) = ? THEN pnl END) "
-                "FROM attempts GROUP BY mode", (today,)):
-            out[mode] = {"attempts": n, "hedged": hedged, "unwound": unwound, "avg_quoted_edge": edge,
-                         "pnl": pnl or 0.0, "pnl_today": pnl_today or 0.0, "settled": settled,
-                         "contracts": contracts or 0}
+        local = _group_stats(c, "attempts", today)
+        try:
+            remote = _group_stats(c, "remote_attempts", today)
+            out["running"] = [{"source": s, "mode": m, "halted": h, "age_s": round(time.time() - seen, 1)}
+                              for s, m, h, seen in c.execute("SELECT source, mode, halted, last_seen FROM remote_state")]
+        except sqlite3.OperationalError:  # nothing has reported yet
+            remote, out["running"] = {}, []
+        for mode in ("live", "shadow"):
+            stats = _merge(local.get(mode), remote.get(mode)) if mode == "live" else \
+                local.get(mode) or remote.get(mode)
+            if stats:
+                out[mode] = stats
         return out
     finally:
         c.close()
@@ -464,6 +568,7 @@ def main() -> None:
         print(json.dumps(summary(), indent=1))
         return
     if args.clear_halt:
+        DB.parent.mkdir(parents=True, exist_ok=True)
         c = sqlite3.connect(DB)
         c.executescript(SCHEMA)
         c.execute("DELETE FROM arb_state WHERE k = 'halted'")
