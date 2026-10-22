@@ -38,6 +38,11 @@ interface Research {
   arb?: ({ mode: string; halted: string | null } & Partial<Record<'shadow' | 'live', ArbStats>>) | null;
 }
 
+interface Balances {
+  kalshi?: number; polymarket?: number; total?: number; kalshi_error?: string; polymarket_error?: string;
+  arb: { mode: string; halted: string | null; pnl: number; pnl_today: number; pairs: number; real: boolean };
+}
+
 interface ArbStats { attempts: number; hedged: number; unwound: number; avg_quoted_edge: number | null; pnl: number; settled: number; contracts: number }
 
 // ─── helpers ─────────────────────────────────────────────────────────
@@ -255,6 +260,31 @@ function ResearchPanel({ r }: { r: Research }) {
   );
 }
 
+function signed(n: number) { return `${n >= 0 ? '+' : '−'}${usd(Math.abs(n))}`; }
+
+function AccountBar({ b }: { b: Balances }) {
+  const a = b.arb;
+  const pnlColor = (n: number) => ({ color: n > 0 ? 'var(--above)' : n < 0 ? 'var(--below)' : 'var(--ink)' });
+  const what = a.real ? 'real money' : a.mode === 'shadow' ? 'shadow, no real orders' : a.mode;
+  return (
+    <Panel grid="grid grid-cols-2 gap-4 md:grid-cols-5">
+      <Stat label="Kalshi" value={b.kalshi_error ? 'error' : usd(b.kalshi)} sub={b.kalshi_error} />
+      <Stat label="Polymarket US" value={b.polymarket_error ? 'error' : usd(b.polymarket)} sub={b.polymarket_error} />
+      <Stat label="Total" value={usd(b.total)} />
+      <div>
+        <div className="text-xs text-[var(--ink-3)]">P&amp;L today</div>
+        <div className="num font-mono text-lg" style={pnlColor(a.pnl_today)}>{signed(a.pnl_today)}</div>
+        <div className="num text-xs text-[var(--ink-2)]">{a.halted ? `halted: ${a.halted}` : what}</div>
+      </div>
+      <div>
+        <div className="text-xs text-[var(--ink-3)]">P&amp;L all time</div>
+        <div className="num font-mono text-lg" style={pnlColor(a.pnl)}>{signed(a.pnl)}</div>
+        <div className="num text-xs text-[var(--ink-2)]">{a.pairs} settled pairs</div>
+      </div>
+    </Panel>
+  );
+}
+
 // ─── page ────────────────────────────────────────────────────────────
 export default function App() {
   const sig = usePoll<Signal>('/signal', 1000);
@@ -262,6 +292,7 @@ export default function App() {
   const history = usePoll<WindowRow[]>('/history?limit=32', 15000);
   const pf = usePoll<Portfolio>('/portfolio', 3000);
   const research = usePoll<Research>('/research', 30000);
+  const balances = usePoll<Balances>('/balances', 15000);
   const ok = sig?.status === 'ok';
   const month = sig?.month;
   const side = sig?.side;
@@ -276,6 +307,8 @@ export default function App() {
         <h1 className="text-lg font-semibold">BTC 15-minute · Kalshi {sig?.ticker && <span className="font-mono text-sm text-[var(--ink-3)]">{sig.ticker}</span>}</h1>
         <div className="text-xs text-[var(--ink-3)]">model {sig?.model ?? '–'} · lock at {pct(sig?.tau, 0)} · ≥{sig?.min_lead_s ?? '–'}s left</div>
       </header>
+
+      {balances && <AccountBar b={balances} />}
 
       <div className="grid gap-4 md:grid-cols-3">
         <Panel className="md:col-span-1">

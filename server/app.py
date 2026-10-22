@@ -489,6 +489,48 @@ def get_portfolio() -> dict:
     return TRADER.status()
 
 
+_BAL: dict = {"ts": 0.0, "data": None}
+
+
+def _balances() -> dict:
+    """Both venues' account balances (Kalshi cash + open positions, Polymarket US cash), cached 15 s."""
+    out: dict = {}
+    if os.environ.get("KALSHI_KEY_ID") and os.environ.get("KALSHI_PRIVATE_KEY_PATH"):
+        try:
+            from .kalshi_client import KalshiClient
+            out["kalshi"] = KalshiClient.from_env().balance()["total"]
+        except Exception as e:  # noqa: BLE001
+            out["kalshi_error"] = str(e)[:200]
+    if os.environ.get("POLYMARKET_KEY_ID") and os.environ.get("POLYMARKET_SECRET_KEY"):
+        try:
+            from .polymarket_us_client import PolymarketUSClient
+            out["polymarket"] = PolymarketUSClient.from_env().balance()["cash"]
+        except Exception as e:  # noqa: BLE001
+            out["polymarket_error"] = str(e)[:200]
+    return out
+
+
+@app.get("/balances")
+def get_balances() -> dict:
+    """Top-of-page account summary: both balances, their total, and the arbitrage trader's realised P&L."""
+    if time.time() - _BAL["ts"] > 15:
+        _BAL["data"], _BAL["ts"] = _balances(), time.time()
+    out = dict(_BAL["data"])
+    if "kalshi" in out or "polymarket" in out:
+        out["total"] = out.get("kalshi", 0.0) + out.get("polymarket", 0.0)
+    from .arb_trader import summary as arb_summary
+    try:
+        a = arb_summary() or {}
+    except sqlite3.Error:
+        a = {}
+    mode = a.get("mode", "off")
+    stats = a.get("live") if mode == "live" or a.get("live") else a.get("shadow")
+    out["arb"] = {"mode": mode, "halted": a.get("halted"), "pnl": (stats or {}).get("pnl", 0.0),
+                  "pnl_today": (stats or {}).get("pnl_today", 0.0), "pairs": (stats or {}).get("settled", 0),
+                  "real": bool(a.get("live"))}
+    return out
+
+
 @app.post("/trading/stop")
 def trading_stop() -> dict:
     if TRADER is None:

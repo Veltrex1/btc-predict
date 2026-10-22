@@ -438,11 +438,14 @@ def summary(db_path: Path = DB) -> dict | None:
     try:
         out = {"mode": os.environ.get("ARB_MODE", "off"),
                "halted": (c.execute("SELECT v FROM arb_state WHERE k = 'halted'").fetchone() or [None])[0]}
-        for (mode, n, hedged, unwound, edge, pnl, settled, contracts) in c.execute(
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        for (mode, n, hedged, unwound, edge, pnl, settled, contracts, pnl_today) in c.execute(
                 "SELECT mode, count(*), sum(status = 'hedged'), sum(status = 'unwound'), avg(quoted_edge), "
-                "sum(pnl), count(pnl), sum(k_filled) FROM attempts GROUP BY mode"):
+                "sum(pnl), count(pnl), sum(k_filled), sum(CASE WHEN substr(settled_ts, 1, 10) = ? THEN pnl END) "
+                "FROM attempts GROUP BY mode", (today,)):
             out[mode] = {"attempts": n, "hedged": hedged, "unwound": unwound, "avg_quoted_edge": edge,
-                         "pnl": pnl or 0.0, "settled": settled, "contracts": contracts or 0}
+                         "pnl": pnl or 0.0, "pnl_today": pnl_today or 0.0, "settled": settled,
+                         "contracts": contracts or 0}
         return out
     finally:
         c.close()
