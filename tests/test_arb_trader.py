@@ -147,3 +147,35 @@ def test_second_leg_limit_scales_with_the_gap():
     assert at.second_leg_limit({"k_price": 0.66, "edge": 0.0508}) == 0.70
     assert at.second_leg_limit({"k_price": 0.28, "edge": 0.0204}) == 0.29
     assert at.second_leg_limit({"k_price": 0.40, "edge": 0.003}) == 0.40
+
+
+class Resp:
+    def __init__(self, code, body):
+        self.status_code, self._body, self.text = code, body, str(body)
+
+    def json(self):
+        return self._body
+
+
+def test_check_previews_both_intents(monkeypatch, capsys):
+    m = {"ticker": "KX-1", "slug": "cpc-btc-updown-15m-2026-10-22-1100z", "close_ts": int(time.time() * 1000) + 600_000}
+    monkeypatch.setattr(at, "current_market", lambda http: m)
+    md = {"marketSlug": m["slug"], "state": "MARKET_STATE_OPEN",
+          "bids": [{"px": {"value": "0.55"}, "qty": "30"}], "offers": [{"px": {"value": "0.56"}, "qty": "20"}]}
+    calls = []
+
+    class PM(FakePM):
+        def place(self, slug, intent, yes_price, qty, preview=False):
+            calls.append((intent, yes_price, preview))
+            return {"order": {"state": "ORDER_STATE_NEW"}}
+    at.check(at.Config(), FakeKalshi([]), PM(0), pm_get=lambda slug: Resp(200, {"marketData": md}))
+    assert calls == [("ORDER_INTENT_BUY_LONG", 0.55, True), ("ORDER_INTENT_BUY_SHORT", 0.56, True)]
+    assert "ACCEPTED" in capsys.readouterr().out
+
+
+def test_check_reports_missing_book(monkeypatch, capsys):
+    m = {"ticker": "KX-1", "slug": "cpc-a", "close_ts": int(time.time() * 1000) + 600_000}
+    monkeypatch.setattr(at, "current_market", lambda http: m)
+    at.check(at.Config(), FakeKalshi([]), FakePM(0), pm_get=lambda slug: Resp(404, {"message": "not found"}))
+    out = capsys.readouterr().out
+    assert "HTTP 404" in out and "no book for this window" in out

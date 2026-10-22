@@ -43,6 +43,7 @@ from recorder.run import parse_pmus, pmus_settle, pmus_slug
 
 from .kalshi_client import Book, KalshiClient, public_book
 from .polymarket_us_client import PolymarketUSClient
+from .polymarket_us_client import GATEWAY as PM_GATEWAY
 from .polymarket_us_client import public_book as pm_public_book
 
 log = logging.getLogger("btc-arb")
@@ -383,6 +384,52 @@ class ArbTrader:
             time.sleep(max(0.0, 0.5 - (time.time() - t0)))
 
 
+def check(cfg: Config, kalshi: KalshiClient | None, pm: PolymarketUSClient | None,
+          http: requests.Session | None = None, pm_get=None) -> None:
+    """Read-only pre-flight: balances, both books, the current gap, and Polymarket's own validation (preview,
+    never placed) of the two order forms the trader sends: Up (BUY_LONG) and Down (BUY_SHORT)."""
+    http = http or requests.Session()
+    pm_get = pm_get or (lambda slug: http.get(f"{PM_GATEWAY}/v1/markets/{slug}/book", timeout=10))
+    if kalshi:
+        print("Kalshi balance:", kalshi.balance())
+    if pm:
+        print("Polymarket US balance:", pm.balance())
+    m = current_market(http)
+    print("window:", m)
+    if not m:
+        print("no open Kalshi window right now (maintenance or between windows); try again in a minute")
+        return
+    kb = kalshi.book(m["ticker"]) if kalshi else public_book(m["ticker"], http)
+    print("Kalshi book:", kb)
+    pb = None
+    for slug in (m["slug"], pmus_slug(datetime.fromtimestamp(m["close_ts"] / 1000, tz=UTC))):
+        r = pm_get(slug)
+        md = r.json().get("marketData") if r.status_code == 200 else None
+        pb = pm_book_from(md)
+        print(f"Polymarket US {slug}: HTTP {r.status_code}", pb if pb else r.text[:200])
+        if pb and slug == m["slug"]:
+            break
+    if not pb or slug != m["slug"]:
+        print("Polymarket US has no book for this window yet; run check again in a minute")
+        return
+    o = opportunity(kb, pb, (m["close_ts"] - time.time() * 1000) / 1000, cfg)
+    print("gap now:", f"{o['side']} {o['edge'] * 100:.2f}c on {o['qty']:.0f} contracts" if o
+          else "none above the minimum edge (normal; the trader waits for one)")
+    if not pm:
+        return
+    for intent, yes_px in (("ORDER_INTENT_BUY_LONG", pb.best_bid), ("ORDER_INTENT_BUY_SHORT", pb.best_ask)):
+        if yes_px is None:
+            print(f"preview {intent}: skipped (no price on that side)")
+            continue
+        try:
+            r = pm.place(m["slug"], intent, yes_px, 1, preview=True)
+            od = r.get("order") or {}
+            print(f"preview {intent} @ Up {yes_px:.2f}: ACCEPTED", {k: od.get(k) for k in
+                  ("state", "intent", "price", "quantity", "commissionsBasisPoints") if k in od} or r)
+        except Exception as e:  # noqa: BLE001
+            print(f"preview {intent} @ Up {yes_px:.2f}: REJECTED {e}")
+
+
 def summary(db_path: Path = DB) -> dict | None:
     """For the dashboard: attempts, fill rates and realised P&L per mode."""
     if not db_path.exists():
@@ -426,26 +473,7 @@ def main() -> None:
     kalshi = KalshiClient.from_env() if have_k else None
     pm = PolymarketUSClient.from_env() if have_pm else None
     if args.check:
-        t = ArbTrader(Config(mode="shadow", **{k: v for k, v in cfg.__dict__.items() if k != "mode"}), kalshi, pm)
-        if kalshi:
-            print("Kalshi balance:", kalshi.balance())
-        if pm:
-            print("Polymarket US balance:", pm.balance())
-        m = current_market(t.http)
-        print("window:", m)
-        if m:
-            kb, pb = t.kbook(m["ticker"]), t.pmbook(m["slug"])
-            print("Kalshi book:", kb)
-            print("Polymarket US book:", pb)
-            if pb:
-                o = opportunity(kb, pb, (m["close_ts"] - time.time() * 1000) / 1000, cfg)
-                print("opportunity now:", json.dumps(o) if o else "none above the minimum edge")
-                if pm and o:
-                    try:
-                        print("Polymarket accepts this order shape (preview):",
-                              json.dumps(pm.place(m["slug"], o["pm_intent"], o["pm_yes"], 1, preview=True))[:600])
-                    except Exception as e:  # noqa: BLE001
-                        print("Polymarket order preview failed:", e)
+        check(cfg, kalshi, pm)
         return
     if args.run:
         if cfg.mode not in ("shadow", "live"):
