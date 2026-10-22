@@ -71,7 +71,6 @@ class Config:
     pairs_per_window: int = 1
     daily_stop: float = 5.0
     floor: float = 2.0
-    slip: float = 0.01          # extra price allowed on the second leg, as long as the pair still clears
 
     @staticmethod
     def from_env() -> Config:
@@ -113,6 +112,12 @@ def opportunity(kb: Book, pm: PMBook, secs_left: float, cfg: Config) -> dict | N
         return None
     o["qty"] = float(min(cfg.max_contracts, math.floor(o["size"] / 2)))  # never take more than half the touch
     return o if o["qty"] >= 1 else None
+
+
+def second_leg_limit(o: dict) -> float:
+    """Worst Kalshi price still worth paying once the Polymarket leg has filled: the quoted price plus the
+    gap less 0.5c, floored to the cent. Unwinding costs ~3-4c a contract, so hedging up to here is never worse."""
+    return math.floor((o["k_price"] + max(0.0, o["edge"] - 0.005)) * 100 + 1e-9) / 100
 
 
 def pair_pnl(row: dict) -> tuple[float, float] | None:
@@ -227,7 +232,7 @@ class ArbTrader:
             return None
         self.refresh_balances()
         if self.cfg.mode == "live":
-            per_k = o["k_price"] + kalshi_fee(1, o["k_price"]) + self.cfg.slip
+            per_k = second_leg_limit(o) + kalshi_fee(1, second_leg_limit(o))
             per_pm = o["pm_price"] + pmus_fee(1, o["pm_price"])
             o["qty"] = float(min(o["qty"], math.floor((self.balances["kalshi"] - self.cfg.floor) / per_k),
                                  math.floor((self.balances["pm"] - self.cfg.floor) / per_pm)))
@@ -241,8 +246,7 @@ class ArbTrader:
                "quoted_edge": o["edge"], "k_side": o["k_side"], "k_price": o["k_price"], "pm_intent": o["pm_intent"],
                "pm_price": o["pm_price"], "size_seen": o["size"], "qty": o["qty"], "unwind_filled": 0.0,
                "unwind_fee": 0.0, "note": ""}
-        # how much worse the Kalshi leg may fill and still leave the pair above zero
-        k_limit = round(min(o["k_price"] + self.cfg.slip, o["k_price"] + max(0.0, o["edge"] - 0.005)), 2)
+        k_limit = second_leg_limit(o)
         if self.cfg.mode == "live":
             self._live(row, o, k_limit)
         else:

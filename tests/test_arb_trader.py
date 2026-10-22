@@ -141,3 +141,9 @@ def test_shadow_fills_from_fresh_books(trader, tmp_path):
     r = t.step()
     assert r["mode"] == "shadow" and r["status"] == "hedged" and r["pm_avg"] == 0.45 and r["k_avg"] == 0.48
     assert at.summary(tmp_path / "arb.sqlite")["shadow"]["attempts"] == 1
+
+
+def test_second_leg_limit_scales_with_the_gap():
+    assert at.second_leg_limit({"k_price": 0.66, "edge": 0.0508}) == 0.70
+    assert at.second_leg_limit({"k_price": 0.28, "edge": 0.0204}) == 0.29
+    assert at.second_leg_limit({"k_price": 0.40, "edge": 0.003}) == 0.40
