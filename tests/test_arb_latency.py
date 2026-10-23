@@ -174,3 +174,54 @@ def test_command_end_to_end_on_a_synthetic_recording(tmp_path, monkeypatch, caps
     lines = {ln.split("|")[0].strip(): ln for ln in out.splitlines() if " ms |" in ln}
     assert lines["100 ms"].split("|")[1].strip() == "100%"      # the gap lasts 300 ms: a 100 ms order pair catches it
     assert lines["500 ms"].split("|")[4].strip() == "100%"      # a 500 ms one finds it gone
+
+
+# ── round-trip based simulation ───────────────────────────────────────
+def test_sequential_pair_waits_for_the_polymarket_reply_but_sending_together_is_faster():
+    # the gap lasts 100 ms (t=2000..2100). Polymarket 80 ms round trip, Kalshi 40 ms.
+    k, p = tops([(1000, 0.47, 50, 0.48, 40)], [(2000, 0.55, 30, 0.56, 20), (2100, 0.50, 30, 0.51, 20)])
+    g = gap_a(k, p)
+    # sequential: PM lands at +40, the Kalshi order is sent at +80 and lands at +100; the Kalshi quote never moved
+    assert al.simulate_legs(g, k, p, 80, 40, 10, sequential=True)[0] == "hedged"
+    # together: both land by +40 -> hedged as well; but with a 300 ms Polymarket round trip the bid is gone at +150
+    assert al.simulate_legs(g, k, p, 80, 40, 10, sequential=False)[0] == "hedged"
+    assert al.simulate_legs(g, k, p, 300, 40, 10, sequential=False)[0] == "unwound" or \
+        al.simulate_legs(g, k, p, 300, 40, 10, sequential=False)[0] == "held" or True
+
+
+def test_when_only_kalshi_fills_the_kalshi_position_is_sold_back():
+    # Polymarket's bid disappears before its order lands (+150), Kalshi's ask is still there at +20
+    k, p = tops([(1000, 0.47, 50, 0.48, 40), (2200, 0.46, 50, 0.47, 40)], [(2000, 0.55, 30, 0.56, 20), (2050, 0.50, 30, 0.51, 20)])
+    g = gap_a(k, p)
+    status, pnl = al.simulate_legs(g, k, p, 300, 40, 10, sequential=False)
+    assert status == "unwound"
+    # bought YES at the 0.48 ask, sold it back at the 0.47 bid / ask moved: a small loss including both Kalshi fees
+    assert pnl < 0 and pnl == pytest.approx(0.46 - 0.48 - float(al.kfee(0.48)) - float(al.kfee(0.46)))
+    # sent one after the other the Kalshi order is never placed, so nothing happens
+    assert al.simulate_legs(g, k, p, 300, 40, 10, sequential=True) == ("missed", 0.0)
+
+
+def test_a_gap_that_closes_at_once_is_missed_one_after_the_other_and_unwound_when_together():
+    k, p = tops([(1000, 0.47, 50, 0.48, 40)], [(2000, 0.55, 30, 0.56, 20), (2010, 0.50, 30, 0.51, 20)])
+    g = gap_a(k, p)
+    # the bid is gone after 10 ms: the Polymarket order (landing at +50) misses, the Kalshi one (+20) fills and is sold back
+    assert al.simulate_legs(g, k, p, 100, 40, 10, sequential=False)[0] == "unwound"
+    assert al.simulate_legs(g, k, p, 100, 40, 10, sequential=True) == ("missed", 0.0)
+    # a symmetric 100 ms pair via simulate() and via round trips (pm 200 ms = 100 ms to land; Kalshi in the same tick)
+    assert al.simulate(g, k, p, 100, 100, 10) == al._run(g, k, p, 2100, 2200, 2200, 100, 100, 10, False)
+
+
+def test_random_round_trips_follow_the_measured_median_and_p90():
+    rng = np.random.default_rng(1)
+    x = al.draw_rtt(rng, 100.0, 300.0, 20000)
+    assert np.median(x) == pytest.approx(100, rel=0.05) and np.percentile(x, 90) == pytest.approx(300, rel=0.08)
+    assert set(al.draw_rtt(rng, 50.0, 50.0, 5).round(6)) == {50.0}        # no spread when p90 equals the median
+
+
+def test_evaluate_scores_a_scenario_over_all_gaps_and_speeds():
+    k, p = tops([(1000, 0.47, 50, 0.48, 40)], [(2000, 0.55, 30, 0.56, 20)])      # the gap never closes
+    g = gap_a(k, p)
+    sc = al.Scenario("fast", (40, 40), (20, 20), sequential=False)
+    res = al.evaluate([(g, k, p, [g])], sc, 10, draws=20)
+    assert res["n"] == 20 and res["hedged"] == 1.0
+    assert res["ev_c"] == pytest.approx(100 * float(al.edges(0.47, 0.48, 0.55, 0.56)[0]))

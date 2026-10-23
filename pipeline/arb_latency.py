@@ -16,6 +16,7 @@ Windows where the live trader would have tried (the first gap of each window) ar
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -116,40 +117,114 @@ def best_edge(k: Top, p: Top, t: int) -> float:
     return float(np.fmax(ea, eb))
 
 
-def simulate(g: Gap, k: Top, p: Top, l1: int, l2: int, qty: float) -> tuple[str, float]:
-    """(status, P&L per contract) of one order pair for this gap. Status: missed, hedged, unwound or held."""
-    t1 = g.t0 + l1
-    pb = p.at(t1)
-    if g.side == "A":      # Polymarket: sell YES (buy Down) into the Up bid
-        pm_ok = pb["bid"] >= g.pm_yes - 1e-9 and pb["bid_sz"] >= qty
-        pm_px = pb["bid"]
-    else:                  # buy YES (Up) from the Up ask
-        pm_ok = pb["ask"] <= g.pm_yes + 1e-9 and pb["ask_sz"] >= qty
-        pm_px = pb["ask"]
-    if not pm_ok:
-        return "missed", 0.0
-    t2 = t1 + l2
-    kb = k.at(t2)
-    if g.side == "A":
-        k_px, k_sz = kb["yes_ask"], kb["yes_ask_sz"]
-        pm_own = 1 - pm_px
-    else:
-        k_px, k_sz = 1 - kb["yes_bid"], kb["yes_bid_sz"]
-        pm_own = pm_px
-    if k_px <= g.k_limit + 1e-9 and k_sz >= qty:
-        return "hedged", 1 - pm_own - k_px - float(pfee(pm_px)) - float(kfee(k_px))
-    # the second leg missed: sell the Polymarket contracts back, within UNWIND_SLACK of the touch seen at t2
-    seen, later = p.at(t2), p.at(t2 + l1)
+def _pm_fill(g: Gap, pb: dict, qty: float) -> tuple[bool, float]:
+    """Does the Polymarket order (sent at the quote that showed the gap) fill against the book `pb`? And at what Up price."""
+    if g.side == "A":      # sell YES (buy Down) into the Up bid
+        return bool(pb["bid"] >= g.pm_yes - 1e-9 and pb["bid_sz"] >= qty), pb["bid"]
+    return bool(pb["ask"] <= g.pm_yes + 1e-9 and pb["ask_sz"] >= qty), pb["ask"]    # buy YES (Up) from the ask
+
+
+def _k_fill(g: Gap, kb: dict, qty: float) -> tuple[bool, float]:
+    """Does the Kalshi order fill within `second_leg_limit`? And at what price of the contract bought."""
+    k_px, k_sz = (kb["yes_ask"], kb["yes_ask_sz"]) if g.side == "A" else (1 - kb["yes_bid"], kb["yes_bid_sz"])
+    return bool(k_px <= g.k_limit + 1e-9 and k_sz >= qty), k_px
+
+
+def _unwind_pm(g: Gap, p: Top, pm_px: float, t_seen: int, t_land: int) -> tuple[str, float]:
+    """Sell the Polymarket contracts back, accepting up to UNWIND_SLACK worse than the touch seen at t_seen."""
+    seen, later = p.at(t_seen), p.at(t_land)
     entry_fee = float(pfee(pm_px))
     if g.side == "A":          # bought Down = sold YES at pm_px; buy YES back at the ask
-        limit = seen["ask"] + UNWIND_SLACK
-        if later["ask"] <= limit + 1e-9:
+        if later["ask"] <= seen["ask"] + UNWIND_SLACK + 1e-9:
             return "unwound", pm_px - later["ask"] - entry_fee - float(pfee(later["ask"]))
-    else:                      # bought YES at pm_px; sell it at the bid
-        limit = seen["bid"] - UNWIND_SLACK
-        if later["bid"] >= limit - 1e-9:
-            return "unwound", later["bid"] - pm_px - entry_fee - float(pfee(later["bid"]))
+    elif later["bid"] >= seen["bid"] - UNWIND_SLACK - 1e-9:     # bought YES at pm_px; sell it at the bid
+        return "unwound", later["bid"] - pm_px - entry_fee - float(pfee(later["bid"]))
     return "held", -entry_fee   # could not sell back: a directional position, worth about zero before its fee
+
+
+def _unwind_k(g: Gap, k: Top, k_px: float, t_seen: int, t_land: int) -> tuple[str, float]:
+    """Sell the Kalshi contracts back (only needed when both orders are sent together and just Kalshi fills)."""
+    seen, later = k.at(t_seen), k.at(t_land)
+    entry_fee = float(kfee(k_px))
+    if g.side == "A":          # bought YES at the ask; sell it at the YES bid
+        back, floor = later["yes_bid"], seen["yes_bid"] - UNWIND_SLACK
+    else:                      # bought NO at 1 - yes_bid; sell it at 1 - yes_ask
+        back, floor = 1 - later["yes_ask"], 1 - seen["yes_ask"] - UNWIND_SLACK
+    if back >= floor - 1e-9:
+        return "unwound", back - k_px - entry_fee - float(kfee(back))
+    return "held", -entry_fee
+
+
+def _run(g: Gap, k: Top, p: Top, t_pm: float, t_k: float, t_decide: float, pm_unwind_ms: float, k_unwind_ms: float,
+         qty: float, k_regardless: bool) -> tuple[str, float]:
+    """Core of every simulation: orders land at t_pm / t_k, failures are noticed at t_decide, unwinds land after
+    their own delay. With k_regardless the Kalshi order goes out even if the Polymarket one fails (both sent together)."""
+    t_pm, t_k, t_decide = int(t_pm), int(t_k), int(t_decide)
+    pm_ok, pm_px = _pm_fill(g, p.at(t_pm), qty)
+    if not pm_ok and not k_regardless:
+        return "missed", 0.0
+    k_ok, k_px = _k_fill(g, k.at(t_k), qty)
+    if pm_ok and k_ok:
+        pm_own = 1 - pm_px if g.side == "A" else pm_px
+        return "hedged", 1 - pm_own - k_px - float(pfee(pm_px)) - float(kfee(k_px))
+    if pm_ok:
+        return _unwind_pm(g, p, pm_px, t_decide, int(t_decide + pm_unwind_ms))
+    if k_ok:
+        return _unwind_k(g, k, k_px, t_decide, int(t_decide + k_unwind_ms))
+    return "missed", 0.0
+
+
+def simulate(g: Gap, k: Top, p: Top, l1: int, l2: int, qty: float) -> tuple[str, float]:
+    """(status, P&L per contract) of one order pair: the Polymarket order lands l1 ms after the gap opens, the Kalshi
+    order l2 ms after that. Status: missed, hedged, unwound or held."""
+    t_pm = g.t0 + l1
+    t_k = t_pm + l2
+    return _run(g, k, p, t_pm, t_k, t_k, l1, l1, qty, False)
+
+
+@dataclass
+class Scenario:
+    label: str
+    pm: tuple[float, float]      # Polymarket round trip: median, 90th percentile (ms)
+    kalshi: tuple[float, float]  # Kalshi round trip: median, 90th percentile (ms)
+    sequential: bool             # True: the Kalshi order is sent only after the Polymarket reply is back
+
+
+DEFAULT_SCENARIOS = [
+    Scenario("Mac as measured, Kalshi order after the Polymarket reply", (118, 368), (31, 103), True),
+    Scenario("Mac as measured, both orders sent together", (118, 368), (31, 103), False),
+    Scenario("Mac on a good day (first run), both together", (63, 244), (31, 103), False),
+    Scenario("server-like speeds, both together", (29, 60), (20, 40), False),
+]
+
+
+def simulate_legs(g: Gap, k: Top, p: Top, pm_rtt: float, k_rtt: float, qty: float, sequential: bool) -> tuple[str, float]:
+    """Like `simulate`, but from round-trip times. An order lands half a round trip after it is sent and its reply
+    is back one round trip after. Sequential: the Kalshi order is sent when the Polymarket reply arrives, and a
+    Kalshi miss is then unwound. Together: both are sent at the gap and either side may need unwinding."""
+    t_pm = g.t0 + pm_rtt / 2
+    if sequential:
+        t_k = g.t0 + pm_rtt + k_rtt / 2
+        return _run(g, k, p, t_pm, t_k, t_k + k_rtt / 2, pm_rtt / 2, k_rtt / 2, qty, False)
+    t_k = g.t0 + k_rtt / 2
+    return _run(g, k, p, t_pm, t_k, g.t0 + max(pm_rtt, k_rtt), pm_rtt / 2, k_rtt / 2, qty, True)
+
+
+def draw_rtt(rng, median: float, p90: float, n: int):
+    """Random round trips with the measured median and 90th percentile (log-normal)."""
+    sigma = max(math.log(max(p90, median) / median), 1e-9) / 1.2816
+    return median * np.exp(rng.normal(0, sigma, n))
+
+
+def evaluate(per_window, sc: Scenario, qty: float, draws: int = 100, seed: int = 0) -> dict:
+    """Summary over every gap x random speeds drawn from the scenario."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for g0, k, p, _ in per_window:
+        pm_rtts = draw_rtt(rng, *sc.pm, draws)
+        k_rtts = draw_rtt(rng, *sc.kalshi, draws)
+        rows += [simulate_legs(g0, k, p, float(a), float(b), qty, sc.sequential) for a, b in zip(pm_rtts, k_rtts)]
+    return summarize(rows)
 
 
 def summarize(rows: list[tuple[str, float]]) -> dict:
@@ -260,6 +335,15 @@ def main() -> None:
             day = " / ".join(f"{x['ev_c'] / 100 * q * x['n'] / days:+.2f}" for x, q in zip(cells, qtys))
             print(f"{lat:>17} ms | {r0['hedged']:>5.0%}  | {r0['unwound']:>6.0%}  | {r0['held']:>3.0%}  | {r0['missed']:>5.0%}  "
                   f"| {r0['ev_c']:>+6.2f}c    | {day}")
+        print("at the speeds measured from this Mac (random round trips with the measured median and 90th percentile):")
+        print(f"{'':<58} | hedged | unwound | held | missed | EV/attempt | $ per day at "
+              + " / ".join(f"{q:g}" for q in qtys) + " contracts")
+        for sc in DEFAULT_SCENARIOS:
+            cells = [evaluate(per_window, sc, q) for q in qtys]
+            r0 = cells[0]
+            day = " / ".join(f"{x['ev_c'] / 100 * q * len(per_window) / days:+.2f}" for x, q in zip(cells, qtys))
+            print(f"{sc.label:<58} | {r0['hedged']:>5.0%}  | {r0['unwound']:>6.0%}  | {r0['held']:>3.0%}  | "
+                  f"{r0['missed']:>5.0%}  | {r0['ev_c']:>+6.2f}c    | {day}")
         print()
 
 
