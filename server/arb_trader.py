@@ -534,6 +534,32 @@ def _merge(a: dict | None, b: dict | None) -> dict | None:
             "avg_quoted_edge": sum(e * w for e, w in edges) / sum(w for _, w in edges) if edges and n else None}
 
 
+def measure_latency(kalshi: KalshiClient | None, pm: PolymarketUSClient | None, n: int = 30) -> None:
+    """Round-trip time of signed read-only requests from this machine. An order costs about one round trip plus
+    matching, so these figures say how long our orders take to land (compare with `pipeline.arb_latency`)."""
+    def timed(name: str, fn) -> None:
+        fn()  # the first call also opens the TLS connection; later orders reuse it
+        ms = []
+        for _ in range(n):
+            t = time.perf_counter()
+            fn()
+            ms.append((time.perf_counter() - t) * 1000)
+            time.sleep(0.15)
+        ms.sort()
+        print(f"{name:<24} median {ms[len(ms) // 2]:>5.0f} ms | 90th percentile {ms[int(len(ms) * 0.9) - 1]:>5.0f} ms "
+              f"| slowest {ms[-1]:>5.0f} ms  ({n} requests)")
+    print("Round trips from this machine (signed, read-only):")
+    if pm:
+        timed("Polymarket US", pm.balance)
+    if kalshi:
+        timed("Kalshi", kalshi.balance)
+    if not (pm or kalshi):
+        print("no credentials configured")
+        return
+    print("\nOne order takes about one of these plus matching. The two legs go one after the other, so the "
+          "second one lands roughly twice the first.")
+
+
 def probe_order(pm: PolymarketUSClient | None) -> None:
     """Buy ONE Up contract at the current ask, show everything Polymarket answers, then sell it back.
     Costs about 5 cents (spread plus fees) and shows whether the displayed book is really executable."""
@@ -609,6 +635,8 @@ def main() -> None:
     ap.add_argument("--check", action="store_true", help="read-only: balances, both books, current opportunity")
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--summary", action="store_true", help="attempts and P&L so far")
+    ap.add_argument("--latency", action="store_true",
+                    help="read-only: round-trip time to Polymarket US and Kalshi from this machine (no orders)")
     ap.add_argument("--probe-order", action="store_true",
                     help="REAL 1-contract Polymarket round trip (buy at the ask, sell back) to see the exchange's replies")
     ap.add_argument("--clear-halt", action="store_true", help="resume after a halt (stop file, daily stop, unhedged)")
@@ -634,6 +662,9 @@ def main() -> None:
         return
     if args.probe_order:
         probe_order(pm)
+        return
+    if args.latency:
+        measure_latency(kalshi, pm)
         return
     if args.run:
         if cfg.mode not in ("shadow", "live"):

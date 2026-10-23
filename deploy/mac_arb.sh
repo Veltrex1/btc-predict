@@ -6,6 +6,7 @@
 #   bash deploy/mac_arb.sh check     read-only: balances, both books, Polymarket order validation
 #   bash deploy/mac_arb.sh shadow    run without sending orders
 #   bash deploy/mac_arb.sh live      real orders (asks you to type LIVE)
+#   bash deploy/mac_arb.sh latency   read-only: how long a round trip to each exchange takes from this Mac
 #   bash deploy/mac_arb.sh probe     ONE real 1-contract Polymarket buy + sell-back (about 5 cents) to see its replies
 #   bash deploy/mac_arb.sh resume    clear a halt (after you checked both apps) and start again in the saved mode
 #   bash deploy/mac_arb.sh status    recent attempts and P&L
@@ -114,6 +115,8 @@ case $cmd in
     [ "$ans" = "LIVE" ] || { echo "Not started."; exit 1; }
     setenv ARB_MODE live; clear_halt; install_agent
     echo "LIVE. Keep this Mac plugged in and online. Watch: tail -f $LOG    Stop: bash deploy/mac_arb.sh off" ;;
+  latency)
+    need_setup; run_py -m server.arb_trader --latency ;;
   probe)
     need_setup
     agent_running && { echo "Stop the trader first: bash deploy/mac_arb.sh off"; exit 1; }

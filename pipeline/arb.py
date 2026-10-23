@@ -37,6 +37,13 @@ DB = DATA_DIR / "ticks.sqlite"
 PMUS_THETA = 0.0695
 
 
+def pmus_slug_for(close_ts: int) -> str:
+    """Polymarket US market slug of the window that closes at close_ts (ms): named after its start."""
+    from datetime import UTC, datetime
+    start = datetime.fromtimestamp(close_ts / 1000 - 900, tz=UTC)
+    return start.strftime("cpc-btc-updown-15m-%Y-%m-%d-%H%Mz")
+
+
 def pmus_fee(count: float, price: float) -> float:
     return PMUS_THETA * count * price * (1 - price)
 

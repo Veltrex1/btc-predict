@@ -267,3 +267,22 @@ def test_trader_treats_an_http_refusal_as_nothing_filled_and_keeps_going(trader)
     t = trader(kalshi=FakeKalshi([10]), pm=Refuses(fill=10))
     r = t.step()
     assert r["status"] == "missed" and "refused" in r["note"] and t.halted is None
+
+
+def test_latency_report_times_both_exchanges_and_places_nothing(capsys, monkeypatch):
+    monkeypatch.setattr(at.time, "sleep", lambda s: None)
+    calls = {"pm": 0, "k": 0}
+
+    class PM:
+        def balance(self):
+            calls["pm"] += 1
+            return {"cash": 1.0, "buying_power": 1.0}
+
+    class K:
+        def balance(self):
+            calls["k"] += 1
+            return {"cash": 1.0}
+    at.measure_latency(K(), PM(), n=5)
+    out = capsys.readouterr().out
+    assert calls == {"pm": 6, "k": 6}          # one warm-up plus five timed requests each
+    assert "Polymarket US" in out and "Kalshi" in out and "median" in out and "90th percentile" in out
