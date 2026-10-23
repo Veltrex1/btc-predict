@@ -269,20 +269,37 @@ def test_trader_treats_an_http_refusal_as_nothing_filled_and_keeps_going(trader)
     assert r["status"] == "missed" and "refused" in r["note"] and t.halted is None
 
 
-def test_latency_report_times_both_exchanges_and_places_nothing(capsys, monkeypatch):
+def test_latency_report_times_each_request_kind_and_places_nothing(capsys, monkeypatch):
     monkeypatch.setattr(at.time, "sleep", lambda s: None)
-    calls = {"pm": 0, "k": 0}
+    monkeypatch.setattr(at, "current_market", lambda http: {"ticker": "KX-1"})
+    monkeypatch.setattr(at.requests.Session, "get", lambda self, *a, **k: None)
+    calls = {"pm": 0, "k_balance": 0, "k_book": 0}
 
     class PM:
         def balance(self):
             calls["pm"] += 1
-            return {"cash": 1.0, "buying_power": 1.0}
 
     class K:
         def balance(self):
-            calls["k"] += 1
-            return {"cash": 1.0}
+            calls["k_balance"] += 1
+
+        def book(self, ticker):
+            assert ticker == "KX-1"
+            calls["k_book"] += 1
     at.measure_latency(K(), PM(), n=5)
     out = capsys.readouterr().out
-    assert calls == {"pm": 6, "k": 6}          # one warm-up plus five timed requests each
-    assert "Polymarket US" in out and "Kalshi" in out and "median" in out and "90th percentile" in out
+    assert calls == {"pm": 6, "k_balance": 6, "k_book": 6}      # one warm-up plus five timed requests each
+    for name in ("Polymarket US balance", "Kalshi plain", "Kalshi order book", "Kalshi account balance"):
+        assert name in out
+    assert "median" in out and "90th percentile" in out
+
+
+def test_latency_report_survives_an_endpoint_that_fails(capsys, monkeypatch):
+    monkeypatch.setattr(at.time, "sleep", lambda s: None)
+
+    class PM:
+        def balance(self):
+            raise RuntimeError("GET /v1/account/balances -> 429: slow down")
+    monkeypatch.setattr(at.requests.Session, "get", lambda self, *a, **k: None)
+    at.measure_latency(None, PM(), n=3)
+    assert "could not be timed" in capsys.readouterr().out

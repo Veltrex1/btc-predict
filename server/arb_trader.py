@@ -535,24 +535,35 @@ def _merge(a: dict | None, b: dict | None) -> dict | None:
 
 
 def measure_latency(kalshi: KalshiClient | None, pm: PolymarketUSClient | None, n: int = 30) -> None:
-    """Round-trip time of signed read-only requests from this machine. An order costs about one round trip plus
-    matching, so these figures say how long our orders take to land (compare with `pipeline.arb_latency`)."""
+    """Round-trip time of read-only requests from this machine. An order costs about one round trip plus matching,
+    so these figures say how long our orders take to land (compare with `pipeline.arb_latency`).
+    Kalshi is timed three ways because its account-balance endpoint can be slow without the order path being slow:
+    a plain unsigned request (the network), the signed order-book request the trader makes, and the balance."""
     def timed(name: str, fn) -> None:
-        fn()  # the first call also opens the TLS connection; later orders reuse it
-        ms = []
-        for _ in range(n):
-            t = time.perf_counter()
-            fn()
-            ms.append((time.perf_counter() - t) * 1000)
-            time.sleep(0.15)
+        try:
+            fn()  # the first call also opens the TLS connection; later orders reuse it
+            ms = []
+            for _ in range(n):
+                t = time.perf_counter()
+                fn()
+                ms.append((time.perf_counter() - t) * 1000)
+                time.sleep(0.15)
+        except Exception as e:  # noqa: BLE001
+            print(f"{name:<28} could not be timed: {str(e)[:150]}")
+            return
         ms.sort()
-        print(f"{name:<24} median {ms[len(ms) // 2]:>5.0f} ms | 90th percentile {ms[int(len(ms) * 0.9) - 1]:>5.0f} ms "
+        print(f"{name:<28} median {ms[len(ms) // 2]:>5.0f} ms | 90th percentile {ms[int(len(ms) * 0.9) - 1]:>5.0f} ms "
               f"| slowest {ms[-1]:>5.0f} ms  ({n} requests)")
-    print("Round trips from this machine (signed, read-only):")
+    print("Round trips from this machine (read-only):")
     if pm:
-        timed("Polymarket US", pm.balance)
+        timed("Polymarket US balance", pm.balance)
+    http = requests.Session()
+    timed("Kalshi plain (unsigned)", lambda: http.get(f"{KALSHI_BASE}/exchange/status", timeout=10))
     if kalshi:
-        timed("Kalshi", kalshi.balance)
+        m = current_market(http)
+        if m:
+            timed("Kalshi order book (signed)", lambda: kalshi.book(m["ticker"]))
+        timed("Kalshi account balance", kalshi.balance)
     if not (pm or kalshi):
         print("no credentials configured")
         return
